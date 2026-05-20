@@ -19,6 +19,7 @@ import {
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
+import { fetchAgentOneCliConfig } from './onecli-per-user.js';
 import { materializeContainerJson } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars, updateContainerConfigJson } from './db/container-configs.js';
@@ -433,28 +434,63 @@ async function buildContainerArgs(
   // The caller (router or host-sweep) catches the throw, leaves the inbound
   // message pending, and the next sweep tick retries.
   //
-  // SoleLaClawde V2.4 carve-out: web-channel agents are provisioned PER
-  // USER by the Solela web app (one OneCLI project + one agent per
-  // Supabase user, identifier `me`). The legacy `ONECLI_API_KEY` this
-  // host is configured with is bound to the org's shared `solelaClaw`
-  // project, so calling `onecli.ensureAgent({ identifier: 'ag-web-<sha1>' })`
-  // here creates a ghost agent in the WRONG project — violating the
-  // "1 user = 1 OneCLI project" isolation invariant. Phase 2 will plumb
-  // the per-agent token from the web app into the spawn flow so the
-  // gateway can scope to the user's own project; until then we no-op
-  // for web users. Non-web channels (Telegram, Slack, WhatsApp, …)
-  // keep the legacy single-project behavior — they're not yet on V2.4.
+  // SoleLaClawde V2.4 split (web channel vs everything else):
+  //
+  //  - Web-channel agents (folder `web-*`): each Solela user has their
+  //    OWN OneCLI project (`solela-<id>`) + agent (`me`) + per-agent
+  //    token provisioned by the web app at signup. We fetch that token
+  //    from the web app's internal API, construct a per-USER OneCLI SDK
+  //    client, and use IT for ensureAgent (no-op since the web app
+  //    already created the agent — but cheap & idempotent) and
+  //    applyContainerConfig. The gateway is then scoped to the user's
+  //    own project: org-level secrets (the Anthropic LLM key) auto-apply
+  //    + project-level secrets (per-user OAuth tokens from
+  //    /api/connect/<app>) inject only for that user.
+  //
+  //  - Non-web channels (Telegram, Slack, WhatsApp, …): keep the legacy
+  //    single-project behavior — they're not yet on V2.4, and their
+  //    OneCLI identity is the agent_group_id under the shared project
+  //    bound to ONECLI_API_KEY.
+  //
+  // If web-channel config fetch fails, we DO NOT silently fall back to
+  // the legacy host key — that would re-create the cross-tenant leak
+  // V2.4 exists to close. We throw, the inbound stays pending, the
+  // sweep retries.
   const isWebChannelAgent = agentGroup.folder.startsWith('web-');
   if (isWebChannelAgent) {
-    log.info(
-      'Skipping OneCLI ensureAgent + gateway for web-channel agent (V2.4 per-agent provisioning handles this on the web app side; Phase 2 will wire the per-agent gateway)',
-      { containerName, folder: agentGroup.folder },
-    );
+    const userCfg = await fetchAgentOneCliConfig(agentGroup.id);
+    if (!userCfg) {
+      throw new Error(
+        `Web-channel agent ${agentGroup.id}: failed to fetch per-user OneCLI config from web app — refusing to spawn (no fallback to legacy shared key, that would re-leak across tenants)`,
+      );
+    }
+    const perUserOneCli = new OneCLI({ url: ONECLI_URL, apiKey: userCfg.token });
+    await perUserOneCli.ensureAgent({
+      name: agentGroup.name,
+      identifier: userCfg.agentIdentifier,
+    });
+    const onecliApplied = await perUserOneCli.applyContainerConfig(args, {
+      addHostMapping: false,
+      agent: userCfg.agentIdentifier,
+    });
+    if (!onecliApplied) {
+      throw new Error(
+        'OneCLI gateway not applied (per-user) — refusing to spawn container without credentials',
+      );
+    }
+    log.info('OneCLI per-user gateway applied', {
+      containerName,
+      projectId: userCfg.projectId,
+      agentIdentifier: userCfg.agentIdentifier,
+    });
   } else {
     if (agentIdentifier) {
       await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
     }
-    const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
+    const onecliApplied = await onecli.applyContainerConfig(args, {
+      addHostMapping: false,
+      agent: agentIdentifier,
+    });
     if (!onecliApplied) {
       throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
     }
