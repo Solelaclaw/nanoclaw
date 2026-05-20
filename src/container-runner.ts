@@ -440,12 +440,18 @@ async function buildContainerArgs(
   //    OWN OneCLI project (`solela-<id>`) + agent (`me`) + per-agent
   //    token provisioned by the web app at signup. We fetch that token
   //    from the web app's internal API, construct a per-USER OneCLI SDK
-  //    client, and use IT for ensureAgent (no-op since the web app
-  //    already created the agent — but cheap & idempotent) and
-  //    applyContainerConfig. The gateway is then scoped to the user's
-  //    own project: org-level secrets (the Anthropic LLM key) auto-apply
-  //    + project-level secrets (per-user OAuth tokens from
-  //    /api/connect/<app>) inject only for that user.
+  //    client, and use IT for `applyContainerConfig`. The gateway is
+  //    then scoped to the user's own project: org-level secrets (the
+  //    Anthropic LLM key) auto-apply + project-level secrets (per-user
+  //    OAuth tokens from /api/connect/<app>) inject only for that user.
+  //
+  //    We do NOT call `ensureAgent` for web users. The SDK's version
+  //    hits the legacy `POST /api/agents` endpoint, which doesn't
+  //    accept per-agent regenerated tokens (returns 401 — only project
+  //    or org keys are honoured there). It's also unnecessary: the
+  //    web app already POSTs the agent via `/v1/agents` during
+  //    `backfillOneCliProvisioning` at signup. The agent is guaranteed
+  //    to exist by the time we get here.
   //
   //  - Non-web channels (Telegram, Slack, WhatsApp, …): keep the legacy
   //    single-project behavior — they're not yet on V2.4, and their
@@ -465,10 +471,6 @@ async function buildContainerArgs(
       );
     }
     const perUserOneCli = new OneCLI({ url: ONECLI_URL, apiKey: userCfg.token });
-    await perUserOneCli.ensureAgent({
-      name: agentGroup.name,
-      identifier: userCfg.agentIdentifier,
-    });
     const onecliApplied = await perUserOneCli.applyContainerConfig(args, {
       addHostMapping: false,
       agent: userCfg.agentIdentifier,
