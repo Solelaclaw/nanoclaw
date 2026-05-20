@@ -470,20 +470,53 @@ async function buildContainerArgs(
         `Web-channel agent ${agentGroup.id}: failed to fetch per-user OneCLI config from web app — refusing to spawn (no fallback to legacy shared key, that would re-leak across tenants)`,
       );
     }
-    const perUserOneCli = new OneCLI({ url: ONECLI_URL, apiKey: userCfg.token });
-    const onecliApplied = await perUserOneCli.applyContainerConfig(args, {
-      addHostMapping: false,
-      agent: userCfg.agentIdentifier,
+    // Bypass the SDK's `applyContainerConfig` — it calls `ensureAgent`
+    // internally against the legacy `POST /api/agents` endpoint, which
+    // rejects per-agent `aoc_` tokens (only project/org keys honoured
+    // there). The same applies to its `getContainerConfig` call when
+    // wrapped behind ensureAgent — failure cascades and the whole
+    // helper returns `false` silently.
+    //
+    // We re-implement only the part that matters: call
+    // `GET /api/container-config?agent=<id>` directly with the per-user
+    // token and push the equivalent docker args (-e env vars + -v
+    // CA cert mount). Same effect as the SDK's applyContainerConfig,
+    // minus the broken ensureAgent step we don't need (the agent was
+    // already POSTed by the web app via `/v1/agents` at signup).
+    const cfgUrl = `${ONECLI_URL.replace(/\/+$/, '')}/api/container-config?agent=${encodeURIComponent(userCfg.agentIdentifier)}`;
+    const cfgRes = await fetch(cfgUrl, {
+      headers: { Authorization: `Bearer ${userCfg.token}` },
     });
-    if (!onecliApplied) {
+    if (!cfgRes.ok) {
+      const body = await cfgRes.text().catch(() => '');
       throw new Error(
-        'OneCLI gateway not applied (per-user) — refusing to spawn container without credentials',
+        `OneCLI container-config ${cfgRes.status}: ${body.slice(0, 200)}`,
       );
     }
-    log.info('OneCLI per-user gateway applied', {
+    const cfg = (await cfgRes.json()) as {
+      env: Record<string, string>;
+      caCertificate: string;
+      caCertificateContainerPath: string;
+    };
+
+    for (const [k, v] of Object.entries(cfg.env)) {
+      args.push('-e', `${k}=${v}`);
+    }
+
+    // Write the gateway CA cert under a per-agent directory + mount it
+    // read-only at the container path the gateway expects. Keeping the
+    // file per-agent (rather than overwriting a shared path) avoids
+    // races between concurrent spawns of different users.
+    const certHostPath = path.join(DATA_DIR, 'onecli-ca', `${agentGroup.id}.crt`);
+    fs.mkdirSync(path.dirname(certHostPath), { recursive: true });
+    fs.writeFileSync(certHostPath, cfg.caCertificate);
+    args.push('-v', `${certHostPath}:${cfg.caCertificateContainerPath}:ro`);
+
+    log.info('OneCLI per-user gateway applied (manual bypass)', {
       containerName,
       projectId: userCfg.projectId,
       agentIdentifier: userCfg.agentIdentifier,
+      envKeys: Object.keys(cfg.env),
     });
   } else {
     if (agentIdentifier) {
