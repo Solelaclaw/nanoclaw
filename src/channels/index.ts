@@ -7,3 +7,6 @@
 // self-registration import below.
 
 import './cli.js';
+import './web.js';
+import './whatsapp.js';
+import './whatsapp-cloud.js';

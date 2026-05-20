@@ -1,48 +1,19 @@
 /**
- * Unknown-channel registration flow.
+ * Unknown-channel registration flow — SOLELACLAWDE V2 overlay.
  *
- * When the router hits an unwired messaging group AND the message was
- * addressed to the bot (SDK-confirmed mention or DM), it calls
- * `requestChannelApproval` instead of silently dropping. The flow:
+ * The only behavioral change from upstream is the delivery-null branch:
+ *   - upstream: if `pickApprovalDelivery` returns null, log a warning and
+ *     return WITHOUT creating a `pending_channel_approvals` row.
+ *   - V2:       always create the row (with `approver_user_id = approvers[0]`
+ *     as a fallback when no DM is reachable). The web inbox claims the row
+ *     via the /admin/pending-approvals API. DM delivery is best-effort.
  *
- *   1. Gather all existing agent groups.
- *   2. Pick an eligible approver (owner / admin) and a reachable DM for
- *      them, reusing the same primitives the sender-approval flow uses.
- *   3. Deliver a card with three action families:
- *        a. Connect to [agent] — one button per existing agent group.
- *           Single-agent installs get a one-click connect.
- *        b. Connect new agent — prompts for a free-text name, creates
- *           the agent immediately on reply.
- *        c. Reject — deny the channel.
- *   4. Record a `pending_channel_approvals` row holding the original event
- *      so it can be re-routed on connect/create.
+ * Rationale: SoleLaClawde users have no NanoClaw DM channel by default. The
+ * org-scoped inbox is the canonical approval surface; the DM card is a
+ * fallback for owners who happen to be wired into a chat platform.
  *
- * On connect (handler in index.ts):
- *   - Create `messaging_group_agents` with defaults
- *     (mention-sticky for groups / pattern='.' for DMs,
- *      sender_scope='known', ignored_message_policy='accumulate')
- *   - Add the triggering sender to `agent_group_members` so sender_scope
- *     doesn't bounce the replayed message into a sender-approval cascade
- *   - Delete the pending row, replay the original event
- *
- * On connect new agent (handler in index.ts):
- *   - Prompt for a free-text agent name via DM
- *   - On reply: create the agent group + filesystem, then wire
- *     and replay as above
- *
- * On reject:
- *   - Set `messaging_groups.denied_at = now()` so the router stops
- *     escalating on this channel until an admin explicitly re-wires
- *   - Delete the pending row
- *
- * Dedup: `pending_channel_approvals` PK on messaging_group_id. Second
- * mention while pending silently dropped.
- *
- * Failure modes (log + no row, so a future attempt can try again):
- *   - No agent groups exist (install never set up a first agent).
- *   - No eligible approver in user_roles (no owner yet).
- *   - Approver has no reachable DM.
- *   - Delivery adapter missing.
+ * Keep this file in sync with upstream `nanoclaw/src/modules/permissions/
+ * channel-approval.ts` — the install.sh overlay clobbers the upstream file.
  */
 import { normalizeOptions, type NormalizedOption, type RawOption } from '../../channels/ask-question.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder, getAllAgentGroups } from '../../db/agent-groups.js';
@@ -172,14 +143,10 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     }
   }
 
+  // V2 behavioural change ↓ — create the pending row even when no DM delivery
+  // is reachable. The org-scoped web inbox claims it via the admin API.
   const delivery = await pickApprovalDelivery(approvers, originChannelType);
-  if (!delivery) {
-    log.warn('Channel registration skipped — no DM channel for any approver', {
-      messagingGroupId,
-      targetAgentGroupId: referenceGroup.id,
-    });
-    return;
-  }
+  const approverUserId = delivery?.userId ?? approvers[0];
 
   const isGroup = event.message?.isGroup ?? originMg?.is_group === 1;
 
@@ -200,11 +167,20 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     messaging_group_id: messagingGroupId,
     agent_group_id: referenceGroup.id,
     original_message: JSON.stringify(event),
-    approver_user_id: delivery.userId,
+    approver_user_id: approverUserId,
     created_at: new Date().toISOString(),
     title,
     options_json: JSON.stringify(options),
   });
+
+  // No DM reachable → row is created, inbox will surface it, return early.
+  if (!delivery) {
+    log.info('Channel approval row created without DM delivery — claim via inbox', {
+      messagingGroupId,
+      approverUserId,
+    });
+    return;
+  }
 
   const adapter = getDeliveryAdapter();
   if (!adapter) {
