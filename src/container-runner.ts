@@ -407,6 +407,15 @@ async function buildContainerArgs(
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
 
+  // SoleLaClawde fork customization: apply per-container resource caps so one
+  // user can't OOM the host on the shared multi-tenant install. Defaults
+  // (1 GB RAM, 0.5 vCPU) are conservative; tune via env at the host level
+  // when sizing the exe.dev VM. Setting either to empty string disables it.
+  const memMax = process.env.SOLELACLAWDE_AGENT_MEMORY_MAX ?? '1g';
+  const cpuMax = process.env.SOLELACLAWDE_AGENT_CPU_MAX ?? '0.5';
+  if (memMax) args.push('--memory', memMax, '--memory-swap', memMax);
+  if (cpuMax) args.push('--cpus', cpuMax);
+
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
@@ -423,14 +432,34 @@ async function buildContainerArgs(
   // a transient hard failure: if we can't wire the gateway, we don't spawn.
   // The caller (router or host-sweep) catches the throw, leaves the inbound
   // message pending, and the next sweep tick retries.
-  if (agentIdentifier) {
-    await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+  //
+  // SoleLaClawde V2.4 carve-out: web-channel agents are provisioned PER
+  // USER by the Solela web app (one OneCLI project + one agent per
+  // Supabase user, identifier `me`). The legacy `ONECLI_API_KEY` this
+  // host is configured with is bound to the org's shared `solelaClaw`
+  // project, so calling `onecli.ensureAgent({ identifier: 'ag-web-<sha1>' })`
+  // here creates a ghost agent in the WRONG project — violating the
+  // "1 user = 1 OneCLI project" isolation invariant. Phase 2 will plumb
+  // the per-agent token from the web app into the spawn flow so the
+  // gateway can scope to the user's own project; until then we no-op
+  // for web users. Non-web channels (Telegram, Slack, WhatsApp, …)
+  // keep the legacy single-project behavior — they're not yet on V2.4.
+  const isWebChannelAgent = agentGroup.folder.startsWith('web-');
+  if (isWebChannelAgent) {
+    log.info(
+      'Skipping OneCLI ensureAgent + gateway for web-channel agent (V2.4 per-agent provisioning handles this on the web app side; Phase 2 will wire the per-agent gateway)',
+      { containerName, folder: agentGroup.folder },
+    );
+  } else {
+    if (agentIdentifier) {
+      await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+    }
+    const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
+    if (!onecliApplied) {
+      throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
+    }
+    log.info('OneCLI gateway applied', { containerName });
   }
-  const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
-  if (!onecliApplied) {
-    throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
-  }
-  log.info('OneCLI gateway applied', { containerName });
 
   // Host gateway
   args.push(...hostGatewayArgs());
