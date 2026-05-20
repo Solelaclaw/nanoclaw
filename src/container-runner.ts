@@ -16,6 +16,7 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   ONECLI_API_KEY,
+  ONECLI_ORG_API_KEY,
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
@@ -464,35 +465,68 @@ async function buildContainerArgs(
   // sweep retries.
   const isWebChannelAgent = agentGroup.folder.startsWith('web-');
   if (isWebChannelAgent) {
+    if (!ONECLI_ORG_API_KEY) {
+      throw new Error(
+        'ONECLI_ORG_API_KEY not set on the VM — required for V2.4 per-user gateway provisioning. Add it to /home/exedev/nanoclaw/.env and restart nanoclaw.service.',
+      );
+    }
     const userCfg = await fetchAgentOneCliConfig(agentGroup.id);
     if (!userCfg) {
       throw new Error(
         `Web-channel agent ${agentGroup.id}: failed to fetch per-user OneCLI config from web app — refusing to spawn (no fallback to legacy shared key, that would re-leak across tenants)`,
       );
     }
-    // Per-user OneCLI SDK instance, constructed with the user's
-    // `aoc_*` per-agent token. The token is project- + agent-scoped
-    // by construction — the SDK reads that context from the token
-    // itself, so we MUST NOT pass an explicit `agent` param. Passing
-    // it triggers an internal lookup on the legacy `/api/agents`
-    // plane (which only accepts `oc_*` / `oc_org_*` keys and 401s
-    // on `aoc_*`), causing `applyContainerConfig` to silently
-    // return `false`. Without `agent`, the SDK picks the right
-    // endpoint internally for the token type, fetches gateway env
-    // vars + CA cert, and pushes them onto `args` for us.
-    const perUserOneCli = new OneCLI({ url: ONECLI_URL, apiKey: userCfg.token });
-    const onecliApplied = await perUserOneCli.applyContainerConfig(args, {
-      addHostMapping: false,
+    // The SDK's `applyContainerConfig` only sends `Authorization: Bearer`
+    // — no `X-Project-Id` header. So even with the org-scoped admin key
+    // it can't tell OneCLI which project to scope to. And the SDK's
+    // public `applyContainerConfig` options don't expose a `projectId`
+    // override either.
+    //
+    // We replicate what the SDK does internally, but add the
+    // `X-Project-Id` header so OneCLI scopes the returned gateway
+    // config to the user's own `solela-<id>` project — same auth
+    // combo we already use successfully against /v1/projects,
+    // /v1/agents, /v1/secrets via our typed client on Vercel.
+    //
+    // Result: container's HTTPS_PROXY + CA cert wired to a gateway
+    // view scoped to the user's project. Org-scope secrets (the
+    // Anthropic LLM key) auto-apply across projects → chat works.
+    // Per-user OAuth tokens (from /api/connect/<app>, stored in
+    // `solela-<id>`) inject only for their owner.
+    const cfgUrl = `${ONECLI_URL.replace(/\/+$/, '')}/api/container-config?agent=${encodeURIComponent(userCfg.agentIdentifier)}`;
+    const cfgRes = await fetch(cfgUrl, {
+      headers: {
+        Authorization: `Bearer ${ONECLI_ORG_API_KEY}`,
+        'X-Project-Id': userCfg.projectId,
+      },
     });
-    if (!onecliApplied) {
+    if (!cfgRes.ok) {
+      const body = await cfgRes.text().catch(() => '');
       throw new Error(
-        'OneCLI gateway not applied (per-user) — refusing to spawn container without credentials',
+        `OneCLI /api/container-config ${cfgRes.status}: ${body.slice(0, 200)}`,
       );
     }
-    log.info('OneCLI per-user gateway applied', {
+    const cfg = (await cfgRes.json()) as {
+      env: Record<string, string>;
+      caCertificate: string;
+      caCertificateContainerPath: string;
+    };
+
+    for (const [k, v] of Object.entries(cfg.env)) {
+      args.push('-e', `${k}=${v}`);
+    }
+    // Per-agent cert path avoids collisions on concurrent spawns of
+    // different users (each gets their own file, mounted RO).
+    const certHostPath = path.join(DATA_DIR, 'onecli-ca', `${agentGroup.id}.crt`);
+    fs.mkdirSync(path.dirname(certHostPath), { recursive: true });
+    fs.writeFileSync(certHostPath, cfg.caCertificate);
+    args.push('-v', `${certHostPath}:${cfg.caCertificateContainerPath}:ro`);
+
+    log.info('OneCLI per-user gateway applied (org-key + X-Project-Id)', {
       containerName,
       projectId: userCfg.projectId,
       agentIdentifier: userCfg.agentIdentifier,
+      envKeys: Object.keys(cfg.env),
     });
   } else {
     if (agentIdentifier) {
