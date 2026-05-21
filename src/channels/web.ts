@@ -74,6 +74,8 @@ import {
 import { deletePendingSenderApproval } from '../modules/permissions/db/pending-sender-approvals.js';
 import { upsertUser } from '../modules/permissions/db/users.js';
 import { routeInbound } from '../router.js';
+import { resolveSession } from '../session-manager.js';
+import { wakeContainer } from '../container-runner.js';
 import type { ChannelAdapter, ChannelSetup, DeliveryAddress, InboundEvent, OutboundMessage } from './adapter.js';
 import { getRegisteredChannelNames, registerChannelAdapter } from './channel-registry.js';
 
@@ -601,6 +603,17 @@ function createAdapter(): ChannelAdapter | null {
           return;
         }
 
+        // SoleLaClawde — pre-warm the user's web-channel container so
+        // the FIRST chat message doesn't pay the full ~6-11s cold-start
+        // (docker spawn + agent-runner Bun init + Claude SDK warmup).
+        // Fired by the web app at the end of onboarding while the user
+        // is still navigating, so by the time they actually type their
+        // first message the container is already running.
+        if (req.method === 'POST' && url === '/admin/wake-container') {
+          void handleWakeContainer(req, res);
+          return;
+        }
+
         // V2.2 — enterprise skills sync. POSTed by the web app whenever a
         // skill is created/edited/deleted, or when a member joins/leaves an
         // org, to rewrite the agent's skills/enterprise/ folder.
@@ -982,6 +995,82 @@ function createAdapter(): ChannelAdapter | null {
       log.error('Web channel provision failed', { err, userId });
       writeJson(res, 500, { error: 'provision failed', detail: (err as Error).message });
     }
+  }
+
+  /**
+   * Pre-warm the user's web-channel container so the FIRST chat message
+   * doesn't pay the cold-start cost (docker spawn + agent-runner Bun
+   * boot + Claude SDK init ≈ 6–11 s the first time).
+   *
+   * Called by the web app at the end of onboarding (while the user is
+   * still going through WhatsApp + tools steps) so by the time they
+   * land on /chat and type, the container is already running and the
+   * first message is processed in 1–3 s.
+   *
+   * Idempotent: if the container is already running, `wakeContainer`
+   * is a no-op. If the session doesn't exist yet, `resolveSession`
+   * creates it on the fly (same path the router takes for an inbound).
+   *
+   * Body: `{ userId }` — the Supabase user id (the same one passed
+   * to /admin/provision). We derive the web messaging_group +
+   * agent_group from it.
+   *
+   * Returns 202 immediately — spawn is fire-and-forget. The caller
+   * (web app) shouldn't block on this; it's an optimization hint.
+   */
+  async function handleWakeContainer(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    let body: { userId?: unknown };
+    try {
+      body = (await readJsonBody(req)) as typeof body;
+    } catch (err) {
+      writeJson(res, 400, { error: 'invalid json', detail: (err as Error).message });
+      return;
+    }
+    if (typeof body.userId !== 'string' || !body.userId) {
+      writeJson(res, 400, { error: 'userId required' });
+      return;
+    }
+    const userId = body.userId;
+    const platformId = platformIdFor(userId);
+    const folder = `web-${userId}`.replace(/[^a-zA-Z0-9_-]/g, '-');
+
+    const ag = getAgentGroupByFolder(folder);
+    if (!ag) {
+      writeJson(res, 404, { error: 'agent group not found', detail: `no agent for ${userId}` });
+      return;
+    }
+    const mg = getMessagingGroupByPlatform('web', platformId);
+    if (!mg) {
+      writeJson(res, 404, { error: 'web messaging group not found', detail: `no mg for ${platformId}` });
+      return;
+    }
+    // session_mode 'shared' matches the wiring set up by handleProvision
+    // (DMs match every message via engage_pattern='.', no threading).
+    const { session } = resolveSession(ag.id, mg.id, null, 'shared');
+
+    // Fire-and-forget. wakeContainer returns false on transient spawn
+    // failure but never throws — log + 202 either way.
+    void wakeContainer(session).then((woke) => {
+      if (!woke) {
+        log.warn('Pre-warm: wakeContainer returned false', {
+          userId,
+          agentGroupId: ag.id,
+          sessionId: session.id,
+        });
+      } else {
+        log.info('Pre-warm: container waking', {
+          userId,
+          agentGroupId: ag.id,
+          sessionId: session.id,
+        });
+      }
+    });
+
+    writeJson(res, 202, {
+      ok: true,
+      agentGroupId: ag.id,
+      sessionId: session.id,
+    });
   }
 
   /**
