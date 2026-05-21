@@ -614,6 +614,15 @@ function createAdapter(): ChannelAdapter | null {
           return;
         }
 
+        // SoleLaClawde — cascade-delete one user's entire NanoClaw
+        // footprint (agent_group, sessions, messaging_groups, users,
+        // filesystem). Used by the wipe-user.ts admin script to reset
+        // a test account end-to-end.
+        if (req.method === 'POST' && url === '/admin/wipe-user') {
+          void handleWipeUser(req, res);
+          return;
+        }
+
         // V2.2 — enterprise skills sync. POSTed by the web app whenever a
         // skill is created/edited/deleted, or when a member joins/leaves an
         // org, to rewrite the agent's skills/enterprise/ folder.
@@ -1071,6 +1080,192 @@ function createAdapter(): ChannelAdapter | null {
       agentGroupId: ag.id,
       sessionId: session.id,
     });
+  }
+
+  /**
+   * Cascade-delete every NanoClaw row + filesystem byte tied to one
+   * user. Used by the SoleLaClawde admin wipe-user.ts script to reset
+   * a test account end-to-end.
+   *
+   * Body: `{ userId }` — the Supabase user id, same as the rest of
+   * the bridge endpoints.
+   *
+   * Cleanup order (each step is non-fatal: errors are logged + we
+   * keep going so a partial state still gets mostly cleaned up):
+   *
+   *   1. Stop any running container for the agent_group
+   *   2. List sessions for the agent_group, delete each session row
+   *      AND its on-disk DBs (data/v2-sessions/<agentGroupId>/<id>/)
+   *   3. Delete the entire data/v2-sessions/<agentGroupId>/ tree
+   *   4. messaging_group_agents WHERE agent_group_id
+   *   5. messaging_groups linked to this user (web + whatsapp if paired)
+   *   6. agent_group_members + user_roles WHERE agent_group_id
+   *   7. user_dms tied to web:<userId> or whatsapp:<phone> entries
+   *   8. container_configs WHERE agent_group_id
+   *   9. agent_groups WHERE id
+   *  10. users WHERE id = 'web:<userId>'
+   *  11. rm -rf groups/<folder>
+   *
+   * Returns 200 with a summary { agentGroupId, deleted: {...counts} }.
+   */
+  async function handleWipeUser(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    let body: { userId?: unknown };
+    try {
+      body = (await readJsonBody(req)) as typeof body;
+    } catch (err) {
+      writeJson(res, 400, { error: 'invalid json', detail: (err as Error).message });
+      return;
+    }
+    if (typeof body.userId !== 'string' || !body.userId) {
+      writeJson(res, 400, { error: 'userId required' });
+      return;
+    }
+    const userId = body.userId;
+    const namespacedUserId = `web:${userId}`;
+    const folder = `web-${userId}`.replace(/[^a-zA-Z0-9_-]/g, '-');
+
+    const ag = getAgentGroupByFolder(folder);
+    if (!ag) {
+      // Idempotent — nothing to wipe means we already succeeded
+      writeJson(res, 200, { ok: true, alreadyWiped: true, userId });
+      return;
+    }
+
+    const db = getDb();
+    const deleted: Record<string, number> = {
+      sessions: 0,
+      messagingGroupAgents: 0,
+      messagingGroups: 0,
+      agentGroupMembers: 0,
+      userRoles: 0,
+      userDms: 0,
+      containerConfigs: 0,
+      users: 0,
+      agentGroups: 0,
+    };
+
+    // 1. Stop containers (best-effort)
+    try {
+      const { execSync } = await import('child_process');
+      const names = execSync(`docker ps --filter "name=nanoclaw-v2-${folder}-" --format '{{.Names}}'`, {
+        encoding: 'utf8',
+      })
+        .split('\n')
+        .filter(Boolean);
+      for (const name of names) {
+        try {
+          execSync(`docker rm -f ${name}`, { stdio: 'pipe' });
+        } catch (err) {
+          log.warn('wipeUser: docker rm failed', { name, err });
+        }
+      }
+    } catch (err) {
+      // docker ps failed — not fatal; the container's --rm will clean it
+      // up when it exits naturally
+      log.warn('wipeUser: docker ps failed', { err });
+    }
+
+    // 2-3. Sessions: rows + on-disk DBs
+    try {
+      const sessionRows = db.prepare('SELECT id FROM sessions WHERE agent_group_id = ?').all(ag.id) as Array<{
+        id: string;
+      }>;
+      for (const s of sessionRows) {
+        const dir = path.join(DATA_DIR, 'v2-sessions', ag.id, s.id);
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+      const res1 = db.prepare('DELETE FROM sessions WHERE agent_group_id = ?').run(ag.id);
+      deleted.sessions = res1.changes;
+      // Drop the per-agent-group session root too (in case it's just the
+      // last session's folder + .claude-shared / heartbeats left over).
+      fs.rmSync(path.join(DATA_DIR, 'v2-sessions', ag.id), { recursive: true, force: true });
+    } catch (err) {
+      log.warn('wipeUser: sessions cleanup failed', { err });
+    }
+
+    // 4. messaging_group_agents
+    try {
+      // Collect mg ids first so we can delete the mg rows that
+      // are exclusively tied to this agent_group.
+      const mgaRows = db
+        .prepare('SELECT messaging_group_id FROM messaging_group_agents WHERE agent_group_id = ?')
+        .all(ag.id) as Array<{ messaging_group_id: string }>;
+      const mgIds = [...new Set(mgaRows.map((r) => r.messaging_group_id))];
+
+      const res2 = db.prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?').run(ag.id);
+      deleted.messagingGroupAgents = res2.changes;
+
+      // 5. messaging_groups (only those left without any wiring after
+      // step 4 — keeps shared mgs intact if any)
+      for (const mgId of mgIds) {
+        const stillLinked = db
+          .prepare('SELECT 1 FROM messaging_group_agents WHERE messaging_group_id = ? LIMIT 1')
+          .get(mgId);
+        if (!stillLinked) {
+          const res3 = db.prepare('DELETE FROM messaging_groups WHERE id = ?').run(mgId);
+          deleted.messagingGroups += res3.changes;
+        }
+      }
+    } catch (err) {
+      log.warn('wipeUser: messaging cleanup failed', { err });
+    }
+
+    // 6. agent_group_members + user_roles
+    try {
+      const res4 = db.prepare('DELETE FROM agent_group_members WHERE agent_group_id = ?').run(ag.id);
+      deleted.agentGroupMembers = res4.changes;
+    } catch (err) {
+      log.warn('wipeUser: members cleanup failed', { err });
+    }
+    try {
+      const res4b = db.prepare('DELETE FROM user_roles WHERE agent_group_id = ?').run(ag.id);
+      deleted.userRoles = res4b.changes;
+    } catch (err) {
+      // user_roles table may not exist on older installs — non-fatal
+      log.warn('wipeUser: user_roles cleanup skipped', { err });
+    }
+
+    // 7. user_dms for this user
+    try {
+      const res5 = db.prepare('DELETE FROM user_dms WHERE user_id = ?').run(namespacedUserId);
+      deleted.userDms = res5.changes;
+    } catch (err) {
+      log.warn('wipeUser: user_dms cleanup failed', { err });
+    }
+
+    // 8. container_configs for this agent_group
+    try {
+      deleteContainerConfig(ag.id);
+      deleted.containerConfigs = 1;
+    } catch (err) {
+      log.warn('wipeUser: container_configs cleanup failed', { err });
+    }
+
+    // 9. agent_groups
+    try {
+      const res6 = db.prepare('DELETE FROM agent_groups WHERE id = ?').run(ag.id);
+      deleted.agentGroups = res6.changes;
+    } catch (err) {
+      log.warn('wipeUser: agent_groups cleanup failed', { err });
+    }
+
+    // 10. users row
+    try {
+      const res7 = db.prepare('DELETE FROM users WHERE id = ?').run(namespacedUserId);
+      deleted.users = res7.changes;
+    } catch (err) {
+      log.warn('wipeUser: users cleanup failed', { err });
+    }
+
+    // 11. groups folder
+    try {
+      fs.rmSync(path.join(GROUPS_DIR, folder), { recursive: true, force: true });
+    } catch (err) {
+      log.warn('wipeUser: groups folder cleanup failed', { err });
+    }
+
+    log.info('wipeUser complete', { userId, agentGroupId: ag.id, deleted });
+    writeJson(res, 200, { ok: true, userId, agentGroupId: ag.id, deleted });
   }
 
   /**
