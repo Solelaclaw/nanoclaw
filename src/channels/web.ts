@@ -987,7 +987,12 @@ function createAdapter(): ChannelAdapter | null {
           engage_pattern: '.',
           sender_scope: 'all',
           ignored_message_policy: 'drop',
-          session_mode: 'shared',
+          // 'agent-shared' — one session per agent_group, ALL messaging_groups
+          // (web, WhatsApp, Telegram, …) share it. Same memory across channels.
+          // The alternative 'shared' (one session per messaging_group) gives
+          // the user separate memories per channel, which is wrong for the
+          // SoleLaClawde single-assistant-per-user model.
+          session_mode: 'agent-shared',
           priority: 0,
           created_at: now,
         });
@@ -1375,7 +1380,10 @@ function createAdapter(): ChannelAdapter | null {
           engage_pattern: '.',
           sender_scope: 'all',
           ignored_message_policy: 'drop',
-          session_mode: 'shared',
+          // 'agent-shared' — see web-provision rationale above. WhatsApp must
+          // share its session with the user's web chat so the agent has one
+          // continuous memory across both channels.
+          session_mode: 'agent-shared',
           priority: 0,
           created_at: now,
         });
@@ -1651,7 +1659,10 @@ function createAdapter(): ChannelAdapter | null {
           engage_pattern: '.',
           sender_scope: 'all',
           ignored_message_policy: 'drop',
-          session_mode: 'shared',
+          // 'agent-shared' — see web-provision rationale above. The user
+          // expects one continuous assistant memory regardless of whether
+          // they're texting via WhatsApp or chatting via web.
+          session_mode: 'agent-shared',
           priority: 0,
           created_at: now,
         });
@@ -1854,7 +1865,10 @@ function createAdapter(): ChannelAdapter | null {
       engage_pattern: isGroup ? null : '.',
       sender_scope: 'known',
       ignored_message_policy: 'accumulate',
-      session_mode: 'shared',
+      // 'agent-shared' — see web-provision rationale above. An inbox-
+      // approved channel joins the user's existing assistant memory rather
+      // than starting a fresh thread isolated from the rest.
+      session_mode: 'agent-shared',
       priority: 0,
       created_at: now,
     });
