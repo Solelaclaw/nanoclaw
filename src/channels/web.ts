@@ -579,6 +579,11 @@ function createAdapter(): ChannelAdapter | null {
           return;
         }
 
+        if (req.method === 'POST' && url === '/admin/channels/telegram/claim-link') {
+          void handleTelegramClaimLink(req, res);
+          return;
+        }
+
         if (req.method === 'POST' && url === '/admin/channels/whatsapp/pair-start') {
           void handleWhatsAppPairStart(req, res);
           return;
@@ -1694,6 +1699,195 @@ function createAdapter(): ChannelAdapter | null {
       });
     } catch (err) {
       log.error('WhatsApp claim-link failed', { err, token });
+      writeJson(res, 500, { error: 'claim failed', detail: (err as Error).message });
+    }
+  }
+
+  /**
+   * Token-based Telegram link claim — sibling of `handleWhatsAppClaimLink`.
+   *
+   * Two text shapes are accepted because Telegram has two natural delivery
+   * paths for the same token:
+   *
+   *   - `link <token>` — typed manually by the user (matches the WhatsApp
+   *     fallback copy on the web form).
+   *   - `/start <token>` — fired automatically by the
+   *     `https://t.me/<bot>?start=<token>` deep link on the user's first
+   *     tap of the "Open Telegram" button on the web form. This is the
+   *     happy path — zero typing.
+   *
+   * Identity parsing differs from WhatsApp: Telegram identities look like
+   * `telegram:<chatId>` (positive integer for DMs, negative for groups).
+   * The response surfaces `chatId` instead of `phone`.
+   *
+   * Body: `{ userId: string, token: string }`
+   * Returns: `{ found: true, identifier, chatId }` or `{ found: false }`
+   */
+  async function handleTelegramClaimLink(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    let body: { userId?: unknown; token?: unknown };
+    try {
+      body = (await readJsonBody(req)) as typeof body;
+    } catch (err) {
+      writeJson(res, 400, { error: 'invalid json', detail: (err as Error).message });
+      return;
+    }
+    if (typeof body.userId !== 'string' || !body.userId) {
+      writeJson(res, 400, { error: 'userId required' });
+      return;
+    }
+    if (typeof body.token !== 'string' || !body.token) {
+      writeJson(res, 400, { error: 'token required' });
+      return;
+    }
+    const token = body.token.trim();
+    if (token.length < 4 || token.length > 32) {
+      writeJson(res, 400, { error: 'token must be 4–32 chars' });
+      return;
+    }
+    const folder = `web-${body.userId}`.replace(/[^a-zA-Z0-9_-]/g, '-');
+    const agentGroup = getAgentGroupByFolder(folder);
+    if (!agentGroup) {
+      writeJson(res, 404, { error: 'agent group not found for web user' });
+      return;
+    }
+
+    // Accept either `link <token>` (manual) or `/start <token>` (deep link).
+    // Both are case-insensitive. Token is regex-escaped before splicing in.
+    const escToken = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const tokenRe = new RegExp(`(?:\\blink\\s+|\\/start\\s+)${escToken}\\b`, 'i');
+
+    type Row = {
+      approval_id: string;
+      messaging_group_id: string;
+      sender_identity: string | null;
+      sender_name: string | null;
+      original_message: string;
+      kind: 'channel' | 'sender';
+    };
+    const rows: Row[] = [
+      ...(getDb()
+        .prepare(
+          `SELECT pca.messaging_group_id AS approval_id, pca.messaging_group_id,
+                  NULL AS sender_identity, NULL AS sender_name,
+                  pca.original_message, 'channel' AS kind
+             FROM pending_channel_approvals pca
+             JOIN messaging_groups mg ON mg.id = pca.messaging_group_id
+            WHERE mg.channel_type = 'telegram'`,
+        )
+        .all() as Row[]),
+      ...(getDb()
+        .prepare(
+          `SELECT psa.id AS approval_id, psa.messaging_group_id, psa.sender_identity,
+                  psa.sender_name, psa.original_message, 'sender' AS kind
+             FROM pending_sender_approvals psa
+             JOIN messaging_groups mg ON mg.id = psa.messaging_group_id
+            WHERE mg.channel_type = 'telegram'`,
+        )
+        .all() as Row[]),
+    ];
+
+    let match: Row | undefined;
+    let matchSenderIdentity: string | null = null;
+    let matchSenderName: string | null = null;
+    for (const row of rows) {
+      try {
+        const event = JSON.parse(row.original_message) as {
+          message?: { content?: unknown; senderId?: string; sender?: string };
+        };
+        const inner = event.message?.content;
+        let text = '';
+        let senderIdFromContent: string | undefined;
+        let senderNameFromContent: string | undefined;
+        if (typeof inner === 'string') {
+          try {
+            const parsed = JSON.parse(inner) as {
+              text?: string;
+              senderId?: string;
+              sender?: string;
+            };
+            text = typeof parsed.text === 'string' ? parsed.text : inner;
+            senderIdFromContent = parsed.senderId;
+            senderNameFromContent = parsed.sender;
+          } catch {
+            text = inner;
+          }
+        } else if (inner && typeof inner === 'object') {
+          const obj = inner as Record<string, unknown>;
+          text = (typeof obj.text === 'string' && obj.text) || (typeof obj.body === 'string' && obj.body) || '';
+          senderIdFromContent = typeof obj.senderId === 'string' ? obj.senderId : undefined;
+          senderNameFromContent = typeof obj.sender === 'string' ? obj.sender : undefined;
+        }
+        if (tokenRe.test(text)) {
+          match = row;
+          matchSenderIdentity = row.sender_identity ?? senderIdFromContent ?? event.message?.senderId ?? null;
+          matchSenderName = row.sender_name ?? senderNameFromContent ?? event.message?.sender ?? null;
+          break;
+        }
+      } catch {
+        // skip malformed rows
+      }
+    }
+
+    if (!match || !matchSenderIdentity) {
+      writeJson(res, 200, { found: false });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    // `telegram:<chatId>` — strip the prefix; whatever remains is the
+    // numeric chat id (negative for groups/channels, positive for DMs).
+    const chatId = matchSenderIdentity.startsWith('telegram:')
+      ? matchSenderIdentity.slice('telegram:'.length)
+      : matchSenderIdentity;
+    const displayName = matchSenderName || `tg:${chatId}`;
+
+    try {
+      upsertUser({
+        id: matchSenderIdentity,
+        kind: 'telegram',
+        display_name: displayName,
+        created_at: now,
+      });
+
+      addMember({
+        user_id: matchSenderIdentity,
+        agent_group_id: agentGroup.id,
+        added_by: null,
+        added_at: now,
+      });
+
+      if (!getMessagingGroupAgentByPair(match.messaging_group_id, agentGroup.id)) {
+        createMessagingGroupAgent({
+          id: `mga-tg-link-${Date.now().toString(36)}`,
+          messaging_group_id: match.messaging_group_id,
+          agent_group_id: agentGroup.id,
+          engage_mode: 'pattern',
+          engage_pattern: '.',
+          sender_scope: 'all',
+          ignored_message_policy: 'drop',
+          session_mode: 'shared',
+          priority: 0,
+          created_at: now,
+        });
+      }
+
+      updateMessagingGroup(match.messaging_group_id, { unknown_sender_policy: 'public' });
+
+      if (match.kind === 'channel') {
+        getDb()
+          .prepare('DELETE FROM pending_channel_approvals WHERE messaging_group_id = ?')
+          .run(match.messaging_group_id);
+      } else {
+        deletePendingSenderApproval(match.approval_id);
+      }
+
+      writeJson(res, 200, {
+        found: true,
+        identifier: matchSenderIdentity,
+        chatId,
+      });
+    } catch (err) {
+      log.error('Telegram claim-link failed', { err, token });
       writeJson(res, 500, { error: 'claim failed', detail: (err as Error).message });
     }
   }
