@@ -569,6 +569,11 @@ function createAdapter(): ChannelAdapter | null {
           return;
         }
 
+        if (req.method === 'GET' && (url === '/admin/channels/links' || url.startsWith('/admin/channels/links?'))) {
+          handleChannelLinks(res, url);
+          return;
+        }
+
         if (req.method === 'POST' && url === '/admin/channels/whatsapp/connect') {
           void handleWhatsAppConnect(req, res);
           return;
@@ -2258,6 +2263,67 @@ function createAdapter(): ChannelAdapter | null {
       userSelfConnect: USER_SELF_CONNECT_CHANNELS.has(name),
     }));
     writeJson(res, 200, { channels });
+  }
+
+  /**
+   * Per-user channel wirings — what does this agent already have linked?
+   *
+   * Drives the /channels page in the web app: instead of every non-web
+   * channel showing a generic "Connect" button regardless of state, the
+   * page can now display "Connected as @<handle>" + a green status pill
+   * when a row exists in messaging_group_agents for that agent +
+   * channel_type pair.
+   *
+   * GET /admin/channels/links?agentGroupId=<id>
+   *   → { links: [{ channelType, platformId, name?, mgaId }] }
+   *
+   * `platformId` is the canonical channel-side identifier (the phone for
+   * WhatsApp, the numeric chat id for Telegram). `name` is the user-side
+   * display name when NanoClaw has stored one (Telegram chat title,
+   * WhatsApp display name) — used for the "Connected as …" subline.
+   *
+   * Multiple links per channel-type are possible (a user with two
+   * Telegram chats wired to the same agent group, for instance) — the
+   * web app coalesces them at render time.
+   */
+  function handleChannelLinks(res: http.ServerResponse, url: string): void {
+    const parsed = new URL(url, 'http://x');
+    const agentGroupId = parsed.searchParams.get('agentGroupId');
+    if (!agentGroupId) {
+      writeJson(res, 400, { error: 'agentGroupId required' });
+      return;
+    }
+
+    interface Row {
+      mga_id: string;
+      messaging_group_id: string;
+      channel_type: string;
+      platform_id: string;
+      name: string | null;
+    }
+    const rows = getDb()
+      .prepare(
+        `SELECT mga.id          AS mga_id,
+                mg.id           AS messaging_group_id,
+                mg.channel_type AS channel_type,
+                mg.platform_id  AS platform_id,
+                mg.name         AS name
+           FROM messaging_group_agents mga
+           JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+          WHERE mga.agent_group_id = ?
+          ORDER BY mga.created_at ASC`,
+      )
+      .all(agentGroupId) as Row[];
+
+    const links = rows.map((r) => ({
+      mgaId: r.mga_id,
+      messagingGroupId: r.messaging_group_id,
+      channelType: r.channel_type,
+      platformId: r.platform_id,
+      name: r.name,
+    }));
+
+    writeJson(res, 200, { links });
   }
 
   function handleStream(req: http.IncomingMessage, res: http.ServerResponse, url: string): void {
