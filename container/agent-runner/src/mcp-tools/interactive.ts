@@ -192,7 +192,7 @@ export const sendCarousel: McpToolDefinition = {
   tool: {
     name: 'send_carousel',
     description:
-      'Send a horizontal row of cards (carousel) to the user. Use when surfacing MULTIPLE options the user should compare or click through — e.g. 3 product picks, 3 trip options, 3 restaurants. Each item has a title, optional imageUrl + description + badge (price, status), and a primary action URL. Always pair with a brief reply line above the carousel explaining what they are, and a recommendation below.',
+      'MANDATORY surface for 2+ comparable items. Call this INSTEAD of writing a markdown/bullet list whenever the user is asking you to compare options — products, hotels, restaurants, trips, gift ideas, recipes, anything where the user\'s next action is "pick one of these". If you find yourself about to write `**🥇 Item 1**`, `1. Option A`, or any numbered/bulleted list of comparable items, STOP and call send_carousel instead. Each item: { title (required), actionUrl (required), description?, imageUrl?, badge? (price/status), actionLabel? }. Always include fallback_text (a numbered text version) for channels that cannot render carousels. Pair with one short prose line above ("Three picks for hiking shoes:") and one recommendation line below ("I\'d go with the Salomon — fastest delivery."). Do not bullet-list as a substitute, ever.',
     inputSchema: {
       type: 'object' as const,
       properties: {
