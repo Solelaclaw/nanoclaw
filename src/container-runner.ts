@@ -422,6 +422,28 @@ async function buildContainerArgs(
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
 
+  // SoleLaClawde bridge env — the SDR agent's `campaigns_*` MCP tools
+  // read these to call the internal API on the web app for persisting
+  // Lead rows and lifecycle status flips. Optional: when unset, the
+  // tools surface a clean "bridge not configured" error to the agent
+  // and the workflow can still run in chat-only mode without
+  // persistence.
+  if (process.env.SOLELACLAWDE_AGENT_API_TOKEN) {
+    args.push('-e', `SOLELACLAWDE_AGENT_API_TOKEN=${process.env.SOLELACLAWDE_AGENT_API_TOKEN}`);
+  }
+  args.push(
+    '-e',
+    `SOLELACLAWDE_API_URL=${process.env.SOLELACLAWDE_API_URL ?? 'https://app.solela.ai'}`,
+  );
+
+  // Apollo API key — used by the apollo_search_prospects /
+  // apollo_enrich_person MCP tools. The host-side env is the source of
+  // truth for now; longer-term this moves into OneCLI's vault (host
+  // pattern `api.apollo.io`) so per-user keys can override.
+  if (process.env.APOLLO_API_KEY) {
+    args.push('-e', `APOLLO_API_KEY=${process.env.APOLLO_API_KEY}`);
+  }
+
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {
@@ -502,9 +524,7 @@ async function buildContainerArgs(
     });
     if (!cfgRes.ok) {
       const body = await cfgRes.text().catch(() => '');
-      throw new Error(
-        `OneCLI /api/container-config ${cfgRes.status}: ${body.slice(0, 200)}`,
-      );
+      throw new Error(`OneCLI /api/container-config ${cfgRes.status}: ${body.slice(0, 200)}`);
     }
     const cfg = (await cfgRes.json()) as {
       env: Record<string, string>;
