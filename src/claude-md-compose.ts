@@ -61,11 +61,38 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
     : {};
   const desired = new Map<string, { type: 'symlink' | 'inline'; content: string }>();
 
-  // Skill fragments — every skill that ships an `instructions.md`.
-  // TODO (shared-source refactor): respect `container.json` skill selection.
+  // Resolve the per-agent-group skill whitelist. Matches the same source
+  // used by `syncSkillSymlinks` in container-runner.ts (the .claude/skills/
+  // symlinks the SDK auto-discovers) — both layers respect the same field
+  // so the agent's CLAUDE.md fragments and its discovered Skill tools stay
+  // in lock-step.
+  //
+  //   'all'   — include every skill found in container/skills/ (default)
+  //   array   — include only the named skills, drop everything else
+  //
+  // The default is 'all' to preserve backward compatibility with agent
+  // groups that pre-date this filter; solelaclawde's provisioning sets the
+  // explicit list at agent-create time based on the org's `kind` (personal
+  // vs business) so personal-org agents don't carry SDR scope and
+  // business-org agents don't carry personal-assistant scope.
+  let allowedSkills: string[] | 'all' = 'all';
+  if (configRow?.skills) {
+    try {
+      const parsed = JSON.parse(configRow.skills) as string[] | 'all';
+      if (parsed === 'all' || Array.isArray(parsed)) {
+        allowedSkills = parsed;
+      }
+    } catch {
+      /* malformed — fall back to 'all' */
+    }
+  }
+
+  // Skill fragments — every skill in `container/skills/` that ships an
+  // `instructions.md` AND is in the whitelist.
   const skillsHostDir = path.join(process.cwd(), 'container', 'skills');
   if (fs.existsSync(skillsHostDir)) {
     for (const skillName of fs.readdirSync(skillsHostDir)) {
+      if (allowedSkills !== 'all' && !allowedSkills.includes(skillName)) continue;
       const hostFragment = path.join(skillsHostDir, skillName, 'instructions.md');
       if (fs.existsSync(hostFragment)) {
         desired.set(`skill-${skillName}.md`, {
