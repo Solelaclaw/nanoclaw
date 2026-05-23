@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@chat-adapter/telegram':
+        specifier: 4.26.0
+        version: 4.26.0
       '@chat-adapter/whatsapp':
         specifier: 4.26.0
         version: 4.26.0
@@ -99,6 +102,9 @@ packages:
 
   '@chat-adapter/shared@4.26.0':
     resolution: {integrity: sha512-YD0MGktFXrArUqTBsyPfL5vkdD1WBS58PAWO0oVrMQAMmPxpAXfWGjBtZCkf3y8R8Svb0uVuVXiMZSForaEnMQ==}
+
+  '@chat-adapter/telegram@4.26.0':
+    resolution: {integrity: sha512-PE2HoCQ4648VNKZTuHFanQNoYzM/niNoSbDyYlPq6VOoB5qsoo1ctR8TERyl1EfPBNexWZpSWYrrnQPr15LUfA==}
 
   '@chat-adapter/whatsapp@4.26.0':
     resolution: {integrity: sha512-4wfWUjIMZRsbKLonQc+U2rIAaG5wDr8agpDmltaUVoHwwRUhnRuf2TX3PpfjJD8qLeHYdY9e7s9f+L4h5IRiuw==}
@@ -2012,6 +2018,13 @@ snapshots:
 
   '@chat-adapter/shared@4.26.0':
     dependencies:
+      chat: 4.26.0
+    transitivePeerDependencies:
+      - supports-color
+
+  '@chat-adapter/telegram@4.26.0':
+    dependencies:
+      '@chat-adapter/shared': 4.26.0
       chat: 4.26.0
     transitivePeerDependencies:
       - supports-color
