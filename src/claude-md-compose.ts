@@ -17,7 +17,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR, GROUPS_DIR } from './config.js';
+import { GROUPS_DIR } from './config.js';
 import type { McpServerConfig } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { log } from './log.js';
@@ -73,39 +73,6 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
           content: `${SHARED_SKILLS_CONTAINER_BASE}/${skillName}/instructions.md`,
         });
       }
-    }
-  }
-
-  // User-installed personal / enterprise skills — surfaced via the Vercel
-  // skills-sync bridge into `.claude-shared/skills/me-*/SKILL.md` (personal)
-  // or `org-*/SKILL.md` (enterprise). The SDK auto-discovers them as Skill
-  // tools, but does NOT auto-load them — claude only invokes them when it
-  // thinks the user query strongly matches the skill's description, which
-  // is unreliable for skills that want to influence every turn (e.g. a
-  // shopping skill that mandates carousel output, or a tone skill that
-  // wants its suffix appended every reply). Inlining the body as a fragment
-  // makes the SKILL.md body part of the system prompt, so the agent reads
-  // it every turn.
-  //
-  // We materialise as `type: 'inline'` (not symlink) so we can strip the
-  // YAML frontmatter — claude doesn't need to see `--- name: ... ---` in
-  // its prompt context, and stripping keeps the system prompt cleaner.
-  const userSkillsHostDir = path.join(DATA_DIR, 'v2-sessions', group.id, '.claude-shared', 'skills');
-  if (fs.existsSync(userSkillsHostDir)) {
-    for (const entry of fs.readdirSync(userSkillsHostDir)) {
-      // Only user-installed skills (me-* personal, org-* enterprise).
-      // Container-bundled skills appear here as symlinks to /app/skills and
-      // are already handled by the block above.
-      if (!entry.startsWith('me-') && !entry.startsWith('org-')) continue;
-      const skillMd = path.join(userSkillsHostDir, entry, 'SKILL.md');
-      if (!fs.existsSync(skillMd)) continue;
-      const raw = fs.readFileSync(skillMd, 'utf-8');
-      // Strip YAML frontmatter (`---\n...\n---`) if present.
-      const body = raw.replace(/^---\n[\s\S]*?\n---\n+/, '');
-      desired.set(`skill-${entry}.md`, {
-        type: 'inline',
-        content: body,
-      });
     }
   }
 
