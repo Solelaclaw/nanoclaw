@@ -10,6 +10,7 @@ import {
   Chat,
   Card,
   CardText,
+  Image,
   Actions,
   Button,
   LinkButton,
@@ -467,6 +468,68 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const card = Card({ title, children: cardChildren });
         const result = await adapter.postMessage(tid, { card, fallbackText });
         return result?.id;
+      }
+
+      // Carousel — N cards sent sequentially, one per item. The Chat SDK
+      // adapters don't have a native "row of cards" primitive (Telegram
+      // would need sendMediaGroup, WhatsApp Cloud has no true carousel
+      // for arbitrary items) so we degrade to one card per message.
+      // From the user's POV they see a stack of 3 cards rather than a
+      // horizontal strip — fine on mobile chat surfaces where vertical
+      // scroll is the native gesture anyway. The web channel handles
+      // its own true horizontal carousel rendering separately.
+      if (content.type === 'carousel' && Array.isArray(content.items)) {
+        interface CarouselItem {
+          title: string;
+          description?: string;
+          imageUrl?: string;
+          badge?: string;
+          actionUrl: string;
+          actionLabel?: string;
+        }
+        const items = content.items as CarouselItem[];
+        const fallbackText =
+          (content.fallbackText as string) ||
+          items.map((it, i) => `${i + 1}. ${it.title} — ${it.actionUrl}`).join('\n');
+
+        let lastId: string | undefined;
+        for (const it of items) {
+          if (!it.title || !it.actionUrl) continue;
+          const titleText = it.badge ? `${it.title} · ${it.badge}` : it.title;
+          const children: CardChild[] = [];
+          if (it.imageUrl) {
+            // The Image() primitive is the Chat SDK's universal handle on
+            // platform-native image rendering — Telegram inlines it
+            // above the card title, WhatsApp Cloud uses it as the
+            // interactive header media, web renders it at the top of
+            // the card.
+            children.push(Image({ url: it.imageUrl, alt: it.title }));
+          }
+          if (it.description) children.push(CardText(it.description));
+          children.push(
+            Actions([
+              LinkButton({
+                label: it.actionLabel || 'View',
+                url: it.actionUrl,
+                style: 'primary',
+              }),
+            ]),
+          );
+          const card = Card({ title: titleText, children });
+          const result = await adapter.postMessage(tid, {
+            card,
+            fallbackText: `${titleText} — ${it.actionUrl}`,
+          });
+          if (result?.id) lastId = result.id;
+        }
+
+        // If literally nothing rendered (every item was malformed) fall
+        // back to the numbered text so the user gets SOMETHING.
+        if (!lastId && fallbackText) {
+          const r = await adapter.postMessage(tid, { markdown: fallbackText, fallbackText });
+          return r?.id;
+        }
+        return lastId;
       }
 
       // Normal message

@@ -697,6 +697,21 @@ function createAdapter(): ChannelAdapter | null {
         return undefined;
       }
 
+      // Carousel payload — emitted by the agent's send_carousel MCP tool.
+      // Unlike the chat-sdk-bridge which renders one card per message
+      // (because most chat platforms don't have a true carousel
+      // primitive), the web client renders a horizontal scrollable strip
+      // of cards in-line. The full items array goes through unchanged;
+      // the renderer in apps/web/src/app/chat/_components/chat-client.tsx
+      // owns the visual layout.
+      if (content && content.type === 'carousel' && Array.isArray(content.items)) {
+        broadcast(userId, {
+          carousel: content.items,
+          fallbackText: content.fallbackText,
+        });
+        return undefined;
+      }
+
       const text = extractText(message);
       if (text === null) return undefined;
 
