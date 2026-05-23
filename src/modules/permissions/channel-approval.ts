@@ -171,7 +171,9 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   const channelName = originMg?.name ?? null;
   const title = isGroup ? '📣 Bot mentioned in new channel' : '💬 New direct message';
   const question = buildQuestionText(isGroup, senderName, channelName, originChannelType);
-  const options = normalizeOptions(buildApprovalOptions(agentGroups, delivery.userId));
+  // `delivery` may be null (no DM reachable); we still create the row + surface
+  // it via inbox below. `buildApprovalOptions` accepts a nullable user id.
+  const options = normalizeOptions(buildApprovalOptions(agentGroups, delivery?.userId ?? null));
 
   createPendingChannelApproval({
     messaging_group_id: messagingGroupId,
