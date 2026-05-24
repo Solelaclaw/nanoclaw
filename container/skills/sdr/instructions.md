@@ -27,6 +27,29 @@ You have these tools:
 - `gcal_*` tools for booking meetings later (Phase C — not yet)
 - `send_carousel` for surfacing leads / drafts back to the user
 
+### MANDATORY: persistence comes FIRST, not last
+
+The single most common failure mode of this skill is: agent calls
+`apollo_search_prospects`, drafts emails in chat memory, shows them in a
+carousel, and never persists. The rep gets the chat reply but their
+`/business/campaigns` dashboard stays empty. **This is broken behaviour
+and must not happen.**
+
+Rule: you MUST call `campaign_create` + `campaign_add_leads` BEFORE you
+write a single word of email draft. The sequence is:
+
+  1. campaign_create        → returns campaign id
+  2. apollo_search_prospects → returns prospects
+  3. campaign_add_leads      → returns lead ids
+  4. draft email per lead + lead_update(drafted) per lead
+  5. send_carousel + ask for approval
+  6. ...
+
+If step 1 or 3 returns an error, STOP and tell the rep — do NOT
+continue with drafts that won't be saved. A failed campaign_create or
+campaign_add_leads means SoleLaClawde PRO isn't reachable and the rep
+needs to know (the work would be lost otherwise).
+
 ### The pipeline — the only sequence you follow
 
 1. **Confirm the ICP**. If the user said "trouve-moi des prospects",

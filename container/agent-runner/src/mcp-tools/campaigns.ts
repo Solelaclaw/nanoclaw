@@ -88,7 +88,7 @@ export const campaignCreate: McpToolDefinition = {
   tool: {
     name: 'campaign_create',
     description:
-      'Create a new outbound campaign for the user. Call this when the user asks you to start a fresh prospecting run that doesn\'t match an existing campaign. Returns `{ id }` — keep this id and pass it to `campaign_add_leads` for every prospect you add. Status starts at "active". Name should be short and descriptive ("Outreach Q1 — SaaS VPs").',
+      'MANDATORY first step of any SDR workflow. Call this BEFORE searching Apollo, BEFORE drafting any emails, BEFORE showing the user anything. If you skip this and go straight to apollo_search_prospects + chat drafting, the rep loses their pipeline — work disappears the moment the session ends. Returns `{ id }` — store this campaign id and pass it to EVERY subsequent campaign_add_leads / lead_update call for this run. Name should be short and descriptive ("Outreach Q1 — SaaS VPs"). Status starts at "active". Do not proceed with prospecting until this returns 200.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -146,7 +146,7 @@ export const campaignAddLeads: McpToolDefinition = {
   tool: {
     name: 'campaign_add_leads',
     description:
-      'Batch-insert up to 100 prospects into a campaign. Use right after `apollo_search_prospects` — pass each Apollo person\'s trimmed fields (name, email, title, company, etc.) as one item in the `leads` array. Returns `{ created, ids }` — `ids` are in the same order as the input so you can use them for follow-up `lead_update` calls (writing the draft body, marking sent, etc.). Status of inserted rows is "enriched".',
+      'MANDATORY second step. Call this IMMEDIATELY after `apollo_search_prospects` returns prospects, BEFORE drafting any emails. Pass each Apollo person\'s trimmed fields (name, email, title, company, etc.) as one item in the `leads` array. Returns `{ created, ids }` — `ids` are in the same order as the input so you can use them for follow-up `lead_update` calls (writing the draft body, marking sent, etc.). Without this call, the leads exist only in your context and disappear when the session ends — the rep loses everything. Status of inserted rows is "enriched".',
     inputSchema: {
       type: 'object' as const,
       properties: {
