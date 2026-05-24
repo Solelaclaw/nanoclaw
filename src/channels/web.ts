@@ -57,7 +57,13 @@ import { DATA_DIR, GROUPS_DIR } from '../config.js';
 const PROJECT_ROOT = path.dirname(GROUPS_DIR);
 import { getDb } from '../db/connection.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../db/agent-groups.js';
-import { createContainerConfig, deleteContainerConfig, getContainerConfig } from '../db/container-configs.js';
+import {
+  createContainerConfig,
+  deleteContainerConfig,
+  ensureContainerConfig,
+  getContainerConfig,
+  updateContainerConfigJson,
+} from '../db/container-configs.js';
 import {
   createMessagingGroup,
   createMessagingGroupAgent,
@@ -855,7 +861,24 @@ function createAdapter(): ChannelAdapter | null {
   }
 
   async function handleProvision(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    let body: { userId?: unknown; displayName?: unknown; agentName?: unknown; instructions?: unknown };
+    let body: {
+      userId?: unknown;
+      displayName?: unknown;
+      agentName?: unknown;
+      instructions?: unknown;
+      /** Optional per-agent container skill whitelist (V2.6+).
+       *
+       * When provided, the caller (solelaclawde web app) is choosing the
+       * exact set of container/skills/* to enable for this agent —
+       * e.g. Pro agents in a business org get the SDR + utility set,
+       * Personal users get the personal-assistant + utility set.
+       *
+       * When omitted, the agent's container_config keeps its default
+       * (currently `"all"` — every container skill is enabled).
+       * Solelaclawde is responsible for sending the right list at
+       * provision time based on Organization.kind. */
+      skills?: unknown;
+    };
     try {
       body = (await readJsonBody(req)) as typeof body;
     } catch (err) {
@@ -869,6 +892,18 @@ function createAdapter(): ChannelAdapter | null {
     const userId = body.userId;
     const displayName = (typeof body.displayName === 'string' && body.displayName) || userId;
     const agentName = (typeof body.agentName === 'string' && body.agentName.trim()) || `${displayName}'s assistant`;
+
+    // Validate skills if provided — must be an array of non-empty strings.
+    // Rejecting malformed input here surfaces a clear error to the caller
+    // rather than silently corrupting the container_config.
+    let skills: string[] | undefined;
+    if (body.skills !== undefined) {
+      if (!Array.isArray(body.skills) || body.skills.some((s) => typeof s !== 'string' || !s.trim())) {
+        writeJson(res, 400, { error: 'skills must be an array of non-empty strings' });
+        return;
+      }
+      skills = body.skills as string[];
+    }
     // Per-user instructions teach the agent the in-conversation tool-connect
     // pattern: any request that would need an external service maps to a
     // `send_card` call with an OneCLI OAuth start URL. The user clicks
@@ -992,6 +1027,17 @@ function createAdapter(): ChannelAdapter | null {
       if (isNew && template && template.id !== ag.id) {
         cloneAgentGroupContent(template.folder, ag.folder);
         cloneContainerConfig(template.id, ag.id, now);
+      }
+
+      // V2.6 — apply per-agent skill whitelist if the caller sent one.
+      // Overwrites whatever default (or cloned-from-template) the agent
+      // started with. Idempotent: passing the same list twice is a no-op.
+      // For an EXISTING agent we still apply so admins can re-tune the
+      // skill set without re-provisioning the user (covers the case where
+      // solelaclawde upgrades an org from personal → business).
+      if (skills) {
+        ensureContainerConfig(ag.id);
+        updateContainerConfigJson(ag.id, 'skills', skills);
       }
 
       // 3. Membership row — gives the user access without granting admin.
