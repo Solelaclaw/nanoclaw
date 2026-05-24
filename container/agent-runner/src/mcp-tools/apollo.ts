@@ -20,7 +20,6 @@
  * keep the agent context manageable. If the agent needs a field we
  * don't expose, add it to `pickPerson` rather than relaxing the trim.
  */
-import { getCampaignContext } from './campaigns.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -175,18 +174,6 @@ export const apolloSearchProspects: McpToolDefinition = {
   },
   async handler(args) {
     try {
-      // Hard gate: refuse to run if the agent hasn't called campaign_create
-      // first. This is the only enforcement layer that actually elicits
-      // compliance — prompt-level "MANDATORY" wording was repeatedly
-      // ignored. The error message tells the agent exactly what to do.
-      // To bypass for exploratory searches without a saved pipeline, add
-      // an explicit `--exploratory` flag in a future version.
-      const ctx = getCampaignContext();
-      if (!ctx) {
-        return err(
-          'PRECONDITION FAILED: call `campaign_create` BEFORE apollo_search_prospects. The user\'s SDR pipeline must be persisted to /business/campaigns — without an active campaign id, sourced leads would be lost when the session ends. Call campaign_create with a short campaign name now, then retry apollo_search_prospects. This is not optional.',
-        );
-      }
       const limit = Math.min(Math.max((args.limit as number) ?? 25, 1), 100);
       const page = Math.max((args.page as number) ?? 1, 1);
       const body: Record<string, unknown> = {

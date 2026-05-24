@@ -2,6 +2,7 @@ import { findByName, getAllDestinations, type DestinationEntry } from './destina
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
+import { refreshSessionRouting } from './db/session-routing.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
 import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
 import {
@@ -114,6 +115,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     markProcessing(ids);
 
     const routing = extractRouting(messages);
+
+    // Refresh session_routing to reflect THIS batch's channel/platform.
+    // Without this, agent-shared sessions that serve multiple channels
+    // (web + Telegram + WhatsApp under one agent) would always have
+    // routing stuck on whichever channel first spawned the container,
+    // breaking MCP tools that depend on the current sender's identity
+    // (e.g. the campaigns bridge that uses X-Acting-Platform-Id to
+    // scope writes to the right Supabase user).
+    refreshSessionRouting({
+      channelType: routing.channelType,
+      platformId: routing.platformId,
+      threadId: routing.threadId,
+    });
 
     // Command handling: the host router gates filtered and unauthorized
     // admin commands before they reach the container. The only command
