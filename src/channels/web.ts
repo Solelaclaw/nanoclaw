@@ -586,6 +586,11 @@ function createAdapter(): ChannelAdapter | null {
           return;
         }
 
+        if (req.method === 'GET' && url.startsWith('/admin/agent-activity')) {
+          handleAgentActivity(res, url);
+          return;
+        }
+
         if (req.method === 'GET' && (url === '/admin/channels/links' || url.startsWith('/admin/channels/links?'))) {
           handleChannelLinks(res, url);
           return;
@@ -2534,6 +2539,68 @@ function createAdapter(): ChannelAdapter | null {
     }));
 
     writeJson(res, 200, { messages: trimmed });
+  }
+
+  /**
+   * Batch "last agent activity" lookup for the admin dashboard.
+   *
+   * GET /admin/agent-activity?agentGroupIds=<id1>,<id2>,...
+   *   → { activity: { [agentGroupId]: lastActiveAtIso | null } }
+   *
+   * Cheap signal: max mtime across the agent's session DB files
+   * (`outbound.db` + `inbound.db` under
+   * `data/v2-sessions/<agentGroupId>/sess-<id>/`). We deliberately avoid
+   * opening each SQLite file and doing `SELECT MAX(timestamp)` — that
+   * would be N×M DB opens for N agents × M sessions per page render.
+   * File mtime is accurate to within a few seconds of the last write,
+   * which is plenty for a "last active" admin column.
+   *
+   * Returns null for any agent that has never spawned a session yet
+   * (provisioned but unused). Caps `agentGroupIds` at 500 to keep one
+   * request bounded.
+   */
+  function handleAgentActivity(res: http.ServerResponse, url: string): void {
+    const parsed = new URL(url, 'http://x');
+    const raw = parsed.searchParams.get('agentGroupIds');
+    if (!raw) {
+      writeJson(res, 400, { error: 'agentGroupIds required' });
+      return;
+    }
+    const ids = raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 500);
+    const activity: Record<string, string | null> = {};
+    for (const agentGroupId of ids) {
+      activity[agentGroupId] = lastActivityFor(agentGroupId);
+    }
+    writeJson(res, 200, { activity });
+  }
+
+  function lastActivityFor(agentGroupId: string): string | null {
+    const sessionsRoot = path.join(DATA_DIR, 'v2-sessions', agentGroupId);
+    if (!fs.existsSync(sessionsRoot)) return null;
+    let maxMs = 0;
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(sessionsRoot);
+    } catch {
+      return null;
+    }
+    for (const sessionDirName of entries) {
+      if (!sessionDirName.startsWith('sess-')) continue;
+      for (const dbName of ['outbound.db', 'inbound.db']) {
+        const dbPath = path.join(sessionsRoot, sessionDirName, dbName);
+        try {
+          const stat = fs.statSync(dbPath);
+          if (stat.mtimeMs > maxMs) maxMs = stat.mtimeMs;
+        } catch {
+          // missing file — that session never wrote to this DB
+        }
+      }
+    }
+    return maxMs > 0 ? new Date(maxMs).toISOString() : null;
   }
 
   /**
