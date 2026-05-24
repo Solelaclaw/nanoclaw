@@ -44,6 +44,7 @@ import fs from 'fs';
 import path from 'path';
 import { spawn, type ChildProcess } from 'child_process';
 
+import BetterSqlite3 from 'better-sqlite3';
 import qrcode from 'qrcode';
 
 import { log } from '../log.js';
@@ -566,6 +567,11 @@ function createAdapter(): ChannelAdapter | null {
 
         if (req.method === 'GET' && url === '/admin/channels') {
           handleChannels(res);
+          return;
+        }
+
+        if (req.method === 'GET' && url.startsWith('/admin/chat-history')) {
+          handleChatHistory(res, url);
           return;
         }
 
@@ -2339,6 +2345,135 @@ function createAdapter(): ChannelAdapter | null {
     }));
 
     writeJson(res, 200, { links });
+  }
+
+  /**
+   * Read-through chat history for the web channel.
+   *
+   * GET /admin/chat-history?agentGroupId=<id>&limit=50
+   *   → { messages: [{ id, role, kind, content, timestamp }, ...] }
+   *
+   * Merges every session's `inbound.db` (web-channel rows only — we don't
+   * leak Telegram/WhatsApp transcripts into the web UI) and `outbound.db`
+   * under `data/v2-sessions/<agentGroupId>/<sessionId>/`, sorts by
+   * timestamp ASC, returns the most recent `limit` rows.
+   *
+   * The endpoint stays read-only and stateless — no caching, no copies
+   * to Postgres. Per the V2 privacy decision the transcript lives only
+   * on the VM; this endpoint exposes it back to the web app per request
+   * so users see history on reload without us persisting it anywhere
+   * else. Shape conversion (content JSON → UiMessage carousel/card/text)
+   * happens in the solelaclawde bridge layer, NOT here.
+   *
+   * Caller scoping is on the web-app side: only that user's own agent
+   * group id is sent (resolved from their Supabase session), so the
+   * existing bridge-token auth + the platform_id ↔ assistant mapping
+   * are the only access controls in play. We deliberately do NOT
+   * cross-check the agentGroupId against the bridge token's caller —
+   * the web app is the trust boundary here.
+   */
+  function handleChatHistory(res: http.ServerResponse, url: string): void {
+    const parsed = new URL(url, 'http://x');
+    const agentGroupId = parsed.searchParams.get('agentGroupId');
+    const limit = Math.min(Math.max(parseInt(parsed.searchParams.get('limit') ?? '50', 10) || 50, 1), 200);
+    if (!agentGroupId) {
+      writeJson(res, 400, { error: 'agentGroupId required' });
+      return;
+    }
+
+    const sessionsRoot = path.join(DATA_DIR, 'v2-sessions', agentGroupId);
+    if (!fs.existsSync(sessionsRoot)) {
+      writeJson(res, 200, { messages: [] });
+      return;
+    }
+
+    interface Row {
+      id: string;
+      role: 'user' | 'assistant';
+      kind: string;
+      content: string;
+      timestamp: string;
+      _ts: number;
+    }
+    const merged: Row[] = [];
+
+    for (const sessionDirName of fs.readdirSync(sessionsRoot)) {
+      if (!sessionDirName.startsWith('sess-')) continue;
+      const sessionPath = path.join(sessionsRoot, sessionDirName);
+
+      // Outbound — assistant messages, all kinds (chat / chat-sdk).
+      const outDbPath = path.join(sessionPath, 'outbound.db');
+      if (fs.existsSync(outDbPath)) {
+        try {
+          const db = new BetterSqlite3(outDbPath, { readonly: true, fileMustExist: true });
+          try {
+            const rows = db
+              .prepare(
+                `SELECT id, kind, content, timestamp
+                   FROM messages_out
+                  ORDER BY timestamp DESC
+                  LIMIT ?`,
+              )
+              .all(limit) as { id: string; kind: string; content: string; timestamp: string }[];
+            for (const r of rows) {
+              merged.push({
+                ...r,
+                role: 'assistant',
+                _ts: Date.parse(r.timestamp) || 0,
+              });
+            }
+          } finally {
+            db.close();
+          }
+        } catch (err) {
+          log.warn('chat-history: failed reading outbound.db', { sessionDirName, err });
+        }
+      }
+
+      // Inbound — user messages. Filter to web channel only so the web
+      // UI doesn't surface Telegram/WhatsApp messages from a shared
+      // agent-shared session.
+      const inDbPath = path.join(sessionPath, 'inbound.db');
+      if (fs.existsSync(inDbPath)) {
+        try {
+          const db = new BetterSqlite3(inDbPath, { readonly: true, fileMustExist: true });
+          try {
+            const rows = db
+              .prepare(
+                `SELECT id, kind, content, timestamp
+                   FROM messages_in
+                  WHERE channel_type = 'web'
+                  ORDER BY timestamp DESC
+                  LIMIT ?`,
+              )
+              .all(limit) as { id: string; kind: string; content: string; timestamp: string }[];
+            for (const r of rows) {
+              merged.push({
+                ...r,
+                role: 'user',
+                _ts: Date.parse(r.timestamp) || 0,
+              });
+            }
+          } finally {
+            db.close();
+          }
+        } catch (err) {
+          log.warn('chat-history: failed reading inbound.db', { sessionDirName, err });
+        }
+      }
+    }
+
+    // Sort ASC by timestamp, keep the most recent `limit` rows.
+    merged.sort((a, b) => a._ts - b._ts);
+    const trimmed = merged.slice(-limit).map((r) => ({
+      id: r.id,
+      role: r.role,
+      kind: r.kind,
+      content: r.content,
+      timestamp: r.timestamp,
+    }));
+
+    writeJson(res, 200, { messages: trimmed });
   }
 
   function handleStream(req: http.IncomingMessage, res: http.ServerResponse, url: string): void {
