@@ -591,6 +591,11 @@ function createAdapter(): ChannelAdapter | null {
           return;
         }
 
+        if (req.method === 'GET' && url.startsWith('/admin/agent-usage')) {
+          handleAgentUsage(res, url);
+          return;
+        }
+
         if (req.method === 'GET' && (url === '/admin/channels/links' || url.startsWith('/admin/channels/links?'))) {
           handleChannelLinks(res, url);
           return;
@@ -2601,6 +2606,180 @@ function createAdapter(): ChannelAdapter | null {
       }
     }
     return maxMs > 0 ? new Date(maxMs).toISOString() : null;
+  }
+
+  /**
+   * Per-agent token + dollar-cost rollup for the admin dashboard.
+   *
+   * GET /admin/agent-usage?agentGroupIds=<csv>&since=<24h|7d|30d|all>
+   *   → { usage: { [agentGroupId]: AgentUsage } }
+   *
+   * Walks each agent's `data/v2-sessions/<id>/sess-*\/usage.jsonl`
+   * files — written by the container on every SDK `result` event (see
+   * `container/agent-runner/src/usage-log.ts`) — sums them, returns a
+   * per-agent total plus a per-model breakdown.
+   *
+   * The `since` window defaults to 30d; valid values are 24h | 7d | 30d
+   * | all. Records older than the window are skipped during the scan
+   * (cheap — we never load the whole file when we don't need to).
+   *
+   * `costUsd` comes straight from the SDK's `total_cost_usd` /
+   * `modelUsage[m].costUSD`, which Anthropic calculates including any
+   * tool/cache surcharges. We never compute pricing ourselves. The
+   * admin UI should label this "estimated API cost" since users on a
+   * Claude.ai subscription don't actually pay this — the auth-mode
+   * distinction lives in OneCLI, not here, so this endpoint stays
+   * auth-agnostic.
+   */
+  interface AgentUsageModelBreakdown {
+    costUsd: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    webSearchRequests: number;
+  }
+
+  interface AgentUsageTotals {
+    costUsd: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    webSearchRequests: number;
+    turnCount: number;
+    byModel: Record<string, AgentUsageModelBreakdown>;
+  }
+
+  function handleAgentUsage(res: http.ServerResponse, url: string): void {
+    const parsed = new URL(url, 'http://x');
+    const raw = parsed.searchParams.get('agentGroupIds');
+    if (!raw) {
+      writeJson(res, 400, { error: 'agentGroupIds required' });
+      return;
+    }
+    const ids = raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 500);
+
+    const sinceParam = (parsed.searchParams.get('since') ?? '30d').toLowerCase();
+    const sinceMs = parseSinceWindow(sinceParam);
+    if (sinceMs === null) {
+      writeJson(res, 400, { error: 'since must be one of: 24h, 7d, 30d, all' });
+      return;
+    }
+
+    const usage: Record<string, AgentUsageTotals> = {};
+    for (const agentGroupId of ids) {
+      usage[agentGroupId] = usageFor(agentGroupId, sinceMs);
+    }
+    writeJson(res, 200, { usage, since: sinceParam });
+  }
+
+  /** Resolve the `since` query param to a cutoff timestamp (ms since
+   * epoch). Returns `0` for "all" (no filter). Returns `null` for an
+   * invalid value. */
+  function parseSinceWindow(value: string): number | null {
+    if (value === 'all') return 0;
+    const now = Date.now();
+    if (value === '24h') return now - 24 * 60 * 60 * 1000;
+    if (value === '7d') return now - 7 * 24 * 60 * 60 * 1000;
+    if (value === '30d') return now - 30 * 24 * 60 * 60 * 1000;
+    return null;
+  }
+
+  function emptyUsage(): AgentUsageTotals {
+    return {
+      costUsd: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      webSearchRequests: 0,
+      turnCount: 0,
+      byModel: {},
+    };
+  }
+
+  function emptyModelBreakdown(): AgentUsageModelBreakdown {
+    return {
+      costUsd: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      webSearchRequests: 0,
+    };
+  }
+
+  /** Sum all `usage.jsonl` lines for one agent, dropping anything
+   * outside the time window. Tolerates malformed lines — the agent's
+   * reply must not be blocked by a broken usage row. */
+  function usageFor(agentGroupId: string, sinceMs: number): AgentUsageTotals {
+    const totals = emptyUsage();
+    const sessionsRoot = path.join(DATA_DIR, 'v2-sessions', agentGroupId);
+    if (!fs.existsSync(sessionsRoot)) return totals;
+
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(sessionsRoot);
+    } catch {
+      return totals;
+    }
+
+    for (const sessionDirName of entries) {
+      if (!sessionDirName.startsWith('sess-')) continue;
+      const filePath = path.join(sessionsRoot, sessionDirName, 'usage.jsonl');
+      let content: string;
+      try {
+        content = fs.readFileSync(filePath, 'utf8');
+      } catch {
+        // File doesn't exist for this session — likely a session that
+        // ran before usage logging shipped. Skip silently.
+        continue;
+      }
+      for (const line of content.split('\n')) {
+        if (!line) continue;
+        let row: Record<string, unknown>;
+        try {
+          row = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const ts = typeof row.ts === 'string' ? Date.parse(row.ts) : NaN;
+        if (Number.isNaN(ts)) continue;
+        if (sinceMs > 0 && ts < sinceMs) continue;
+
+        totals.costUsd += numOr0(row.costUsd);
+        totals.inputTokens += numOr0(row.inputTokens);
+        totals.outputTokens += numOr0(row.outputTokens);
+        totals.cacheReadTokens += numOr0(row.cacheReadTokens);
+        totals.cacheWriteTokens += numOr0(row.cacheWriteTokens);
+        totals.webSearchRequests += numOr0(row.webSearchRequests);
+        totals.turnCount += 1;
+
+        const byModel = row.byModel as Record<string, Record<string, unknown>> | undefined;
+        if (byModel) {
+          for (const [model, mu] of Object.entries(byModel)) {
+            const bucket = totals.byModel[model] ?? emptyModelBreakdown();
+            bucket.costUsd += numOr0(mu.costUsd);
+            bucket.inputTokens += numOr0(mu.inputTokens);
+            bucket.outputTokens += numOr0(mu.outputTokens);
+            bucket.cacheReadTokens += numOr0(mu.cacheReadTokens);
+            bucket.cacheWriteTokens += numOr0(mu.cacheWriteTokens);
+            bucket.webSearchRequests += numOr0(mu.webSearchRequests);
+            totals.byModel[model] = bucket;
+          }
+        }
+      }
+    }
+    return totals;
+  }
+
+  function numOr0(v: unknown): number {
+    return typeof v === 'number' && Number.isFinite(v) ? v : 0;
   }
 
   /**
