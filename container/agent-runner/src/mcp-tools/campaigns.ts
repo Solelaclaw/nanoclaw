@@ -27,28 +27,6 @@ function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
 }
 
-/**
- * Session-scoped campaign context. Set when `campaign_create` succeeds;
- * read by `apollo_search_prospects` (in apollo.ts) as a precondition.
- *
- * Persists for the lifetime of the container (one session). New session
- * = new container = fresh null. This is the brutal enforcement that
- * prompt-level "MANDATORY" instructions couldn't deliver — the agent
- * literally cannot search Apollo until it creates a campaign first.
- *
- * Exporting via getter (not the variable directly) so the apollo tool
- * always reads the current value, not a stale snapshot from import time.
- */
-let _campaignContext: { id: string; name: string } | null = null;
-
-export function getCampaignContext(): { id: string; name: string } | null {
-  return _campaignContext;
-}
-
-export function _setCampaignContextForTests(ctx: { id: string; name: string } | null): void {
-  _campaignContext = ctx;
-}
-
 function ok(text: string) {
   return { content: [{ type: 'text' as const, text }] };
 }
@@ -135,13 +113,6 @@ export const campaignCreate: McpToolDefinition = {
       });
       if (status >= 400) {
         return err(`campaign_create ${status}: ${JSON.stringify(data).slice(0, 300)}`);
-      }
-      // Stash for the apollo gate. apollo_search_prospects refuses to
-      // run until this is set — that's how we enforce the "create
-      // campaign first" rule that prompt-level wording wouldn't.
-      const created = (data as { campaign?: { id?: string; name?: string } })?.campaign;
-      if (created?.id) {
-        _campaignContext = { id: created.id, name: created.name ?? name.trim() };
       }
       log(`campaign_create: ok ${JSON.stringify(data).slice(0, 120)}`);
       return ok(JSON.stringify(data));
