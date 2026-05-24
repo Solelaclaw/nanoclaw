@@ -575,6 +575,11 @@ function createAdapter(): ChannelAdapter | null {
           return;
         }
 
+        if (req.method === 'GET' && url.startsWith('/admin/contacts')) {
+          handleContactsFromMemory(res, url);
+          return;
+        }
+
         if (req.method === 'GET' && (url === '/admin/channels/links' || url.startsWith('/admin/channels/links?'))) {
           handleChannelLinks(res, url);
           return;
@@ -2474,6 +2479,139 @@ function createAdapter(): ChannelAdapter | null {
     }));
 
     writeJson(res, 200, { messages: trimmed });
+  }
+
+  /**
+   * People/contacts the agent has surfaced in its working memory.
+   *
+   * GET /admin/contacts?agentGroupId=<id>&limit=200
+   *   → { contacts: [{ id, name, role, company, email?, linkedinUrl?,
+   *                    badge?, imageUrl?, firstSeenAt }, ...] }
+   *
+   * Source of truth: the agent's outbound carousel messages. Whenever
+   * the agent sends a `send_carousel` payload (currently used by SDR
+   * for prospect picks, the shopping skill for product options, the
+   * gift-finder skill for recipient ideas, etc.), every item in that
+   * carousel is a "person or option the agent has surfaced" for the
+   * user. We extract those items as contacts.
+   *
+   * Why scan the agent's memory instead of the structured Lead table:
+   * the Lead table is populated only when the agent successfully calls
+   * the campaigns API (campaign_add_leads). When that path fails — e.g.
+   * stale session_routing → 404 on the internal-agent API — the Lead
+   * table stays empty even though the agent DID surface contacts to
+   * the user via carousel. Reading from outbound directly gives the
+   * /contacts page a reliable "what did the agent show me" source
+   * regardless of whether the structured persistence path worked.
+   *
+   * Dedup: items with the same title are deduped, keeping the most
+   * recent occurrence (the agent often shows the same prospect across
+   * iterations). The Lead table can later be re-introduced as a richer
+   * source on top of this baseline (merge by name + company).
+   */
+  function handleContactsFromMemory(res: http.ServerResponse, url: string): void {
+    const parsed = new URL(url, 'http://x');
+    const agentGroupId = parsed.searchParams.get('agentGroupId');
+    const limit = Math.min(Math.max(parseInt(parsed.searchParams.get('limit') ?? '200', 10) || 200, 1), 500);
+    if (!agentGroupId) {
+      writeJson(res, 400, { error: 'agentGroupId required' });
+      return;
+    }
+
+    const sessionsRoot = path.join(DATA_DIR, 'v2-sessions', agentGroupId);
+    if (!fs.existsSync(sessionsRoot)) {
+      writeJson(res, 200, { contacts: [] });
+      return;
+    }
+
+    interface CarouselItemRaw {
+      title?: string;
+      description?: string;
+      imageUrl?: string;
+      badge?: string;
+      actionUrl?: string;
+      actionLabel?: string;
+    }
+
+    interface ContactOut {
+      id: string;
+      name: string;
+      description?: string;
+      imageUrl?: string;
+      badge?: string;
+      actionUrl?: string;
+      actionLabel?: string;
+      firstSeenAt: string;
+    }
+
+    // Keep the most-recent occurrence per `title` — agent often
+    // re-presents the same prospect across iterations of a batch.
+    const byTitle = new Map<string, { ts: number; row: ContactOut }>();
+
+    for (const sessionDirName of fs.readdirSync(sessionsRoot)) {
+      if (!sessionDirName.startsWith('sess-')) continue;
+      const outDbPath = path.join(sessionsRoot, sessionDirName, 'outbound.db');
+      if (!fs.existsSync(outDbPath)) continue;
+      try {
+        const db = new BetterSqlite3(outDbPath, { readonly: true, fileMustExist: true });
+        try {
+          const rows = db
+            .prepare(
+              `SELECT id, content, timestamp
+                 FROM messages_out
+                WHERE kind = 'chat-sdk'
+                ORDER BY timestamp DESC
+                LIMIT ?`,
+            )
+            .all(limit) as { id: string; content: string; timestamp: string }[];
+          for (const r of rows) {
+            let payload: unknown;
+            try {
+              payload = JSON.parse(r.content);
+            } catch {
+              continue;
+            }
+            if (
+              !payload ||
+              typeof payload !== 'object' ||
+              (payload as { type?: string }).type !== 'carousel' ||
+              !Array.isArray((payload as { items?: unknown[] }).items)
+            ) {
+              continue;
+            }
+            const items = (payload as { items: CarouselItemRaw[] }).items;
+            const ts = Date.parse(r.timestamp) || 0;
+            for (const [i, it] of items.entries()) {
+              if (!it.title) continue;
+              const existing = byTitle.get(it.title);
+              if (existing && existing.ts >= ts) continue;
+              byTitle.set(it.title, {
+                ts,
+                row: {
+                  id: `${r.id}-${i}`,
+                  name: it.title,
+                  description: it.description,
+                  imageUrl: it.imageUrl,
+                  badge: it.badge,
+                  actionUrl: it.actionUrl,
+                  actionLabel: it.actionLabel,
+                  firstSeenAt: r.timestamp,
+                },
+              });
+            }
+          }
+        } finally {
+          db.close();
+        }
+      } catch (err) {
+        log.warn('contacts-from-memory: failed reading outbound.db', { sessionDirName, err });
+      }
+    }
+
+    // Sort by recency desc — most recently surfaced first.
+    const contacts = [...byTitle.values()].sort((a, b) => b.ts - a.ts).map((e) => e.row);
+
+    writeJson(res, 200, { contacts });
   }
 
   function handleStream(req: http.IncomingMessage, res: http.ServerResponse, url: string): void {
