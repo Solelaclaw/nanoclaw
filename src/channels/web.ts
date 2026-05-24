@@ -698,6 +698,15 @@ function createAdapter(): ChannelAdapter | null {
       if (!userId) return undefined;
       const content = message.content as Record<string, unknown> | undefined;
 
+      // Step payload — emitted by the agent's `agent_step` MCP tool.
+      // Renders as a Perplexity-style progress line in the chat. The
+      // chat client groups consecutive steps + auto-collapses the
+      // group when the next non-step message arrives.
+      if (content && content.type === 'step' && typeof content.title === 'string') {
+        broadcast(userId, { step: { title: content.title } });
+        return undefined;
+      }
+
       // Card payload — emitted by the agent's send_card MCP tool. Carries
       // title/description plus a list of URL link buttons. The chat UI renders
       // these inline so the user can click straight through to e.g. an OAuth

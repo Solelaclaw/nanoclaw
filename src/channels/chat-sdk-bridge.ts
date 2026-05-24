@@ -91,6 +91,33 @@ export interface ChatSdkBridgeConfig {
  * Falls back to treating the tail as a literal value so old in-flight cards
  * (encoded before this shortening landed) still resolve.
  */
+/**
+ * Per-conversation state for the `agent_step` Perplexity-style progress
+ * UI on chat-sdk channels (Telegram, Slack, Discord, etc.). When the
+ * agent calls `agent_step` we post a single pinned message and then
+ * edit it in place as more steps arrive — gives a "live" effect on
+ * platforms that support editMessage. The Map entry is cleared when
+ * the next non-step outbound message arrives (the agent's actual
+ * reply), so the next step starts a fresh pinned message.
+ *
+ * Keyed by platformId + threadId so concurrent step groups in
+ * different chats don't trample each other.
+ */
+interface StepGroupState {
+  messageId: string;
+  steps: string[]; // titles in order, most recent last
+}
+const stepGroups = new Map<string, StepGroupState>();
+
+function stepGroupKey(platformId: string, threadId: string | null): string {
+  return `${platformId}::${threadId ?? ''}`;
+}
+
+/** Render a step list: most recent is `●` (pulse), prior are `✓`. */
+function renderStepGroup(steps: string[]): string {
+  return steps.map((s, i) => (i === steps.length - 1 ? `● ${s}` : `✓ ${s}`)).join('\n');
+}
+
 function resolveSelectedOption(
   render: { options: NormalizedOption[] } | undefined,
   eventValue: string | undefined,
@@ -371,6 +398,64 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // "discord:guildId:channelId") — use it directly as the thread ID
       const tid = threadId ?? platformId;
       const content = message.content as Record<string, unknown>;
+
+      // Step payload — emitted by the agent's `agent_step` MCP tool.
+      // Renders Perplexity-style progress in the chat: each new step
+      // edits a single pinned message in place so the user sees the
+      // list grow + the current step pulse. When the next non-step
+      // payload arrives we clear the group state (below), so the next
+      // step starts a fresh pinned message.
+      //
+      // No wrapper text, no "Working…" header — per the user's
+      // requested UX, just the bare step list.
+      if (content.type === 'step' && typeof content.title === 'string') {
+        const key = stepGroupKey(platformId, threadId);
+        const existing = stepGroups.get(key);
+        const steps = existing ? [...existing.steps, content.title] : [content.title];
+        const rendered = renderStepGroup(steps);
+        if (existing) {
+          try {
+            await adapter.editMessage(tid, existing.messageId, { markdown: transformText(rendered) });
+            existing.steps = steps;
+          } catch {
+            // Edit can fail (rate limit, message too old). Fall back to
+            // a fresh post so the user still gets the update.
+            const result = await adapter.postMessage(tid, { markdown: transformText(rendered) });
+            if (result?.id) {
+              stepGroups.set(key, { messageId: result.id, steps });
+            }
+          }
+        } else {
+          const result = await adapter.postMessage(tid, { markdown: transformText(rendered) });
+          if (result?.id) {
+            stepGroups.set(key, { messageId: result.id, steps });
+          }
+        }
+        return;
+      }
+
+      // Any non-step payload closes the current step group — next step
+      // (if any) starts a fresh pinned message rather than appending to
+      // a stale group. The closed group's message stays in the chat
+      // as a record of what happened.
+      const closingKey = stepGroupKey(platformId, threadId);
+      if (stepGroups.has(closingKey)) {
+        const closed = stepGroups.get(closingKey)!;
+        // Final edit: mark the last step as done (✓ instead of ●) so
+        // the trailing pulse character doesn't look like the agent is
+        // still working on it.
+        try {
+          const finalRender = closed.steps.map((s) => `✓ ${s}`).join('\n');
+          if (finalRender) {
+            await adapter.editMessage(tid, closed.messageId, {
+              markdown: transformText(finalRender),
+            });
+          }
+        } catch {
+          /* edit failure is non-fatal here — the previous render stays */
+        }
+        stepGroups.delete(closingKey);
+      }
 
       if (content.operation === 'edit' && content.messageId) {
         await adapter.editMessage(tid, content.messageId as string, {
