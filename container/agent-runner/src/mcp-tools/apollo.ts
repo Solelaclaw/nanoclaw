@@ -190,7 +190,11 @@ export const apolloSearchProspects: McpToolDefinition = {
       if (typeof args.keywords === 'string' && args.keywords.trim()) body.q_keywords = args.keywords.trim();
 
       log(`apollo_search_prospects: ${JSON.stringify(body)}`);
-      const result = (await apolloFetch('/mixed_people/search', body)) as {
+      // Note: `/mixed_people/api_search` is the EXTERNAL-API variant.
+      // `/mixed_people/search` returns 403 for API keys — it's the
+      // internal dashboard endpoint, only callable by browser sessions.
+      // Apollo's docs put `api_search` under "API → Search People".
+      const result = (await apolloFetch('/mixed_people/api_search', body)) as {
         people?: ApolloPerson[];
         pagination?: { page?: number; per_page?: number; total_entries?: number; total_pages?: number };
       };
