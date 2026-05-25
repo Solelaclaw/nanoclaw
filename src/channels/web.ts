@@ -596,6 +596,11 @@ function createAdapter(): ChannelAdapter | null {
           return;
         }
 
+        if (req.method === 'GET' && url.startsWith('/admin/channel-status')) {
+          handleChannelStatus(res, url);
+          return;
+        }
+
         if (req.method === 'GET' && (url === '/admin/channels/links' || url.startsWith('/admin/channels/links?'))) {
           handleChannelLinks(res, url);
           return;
@@ -2415,6 +2420,93 @@ function createAdapter(): ChannelAdapter | null {
     }));
 
     writeJson(res, 200, { links });
+  }
+
+  /**
+   * Batch "what channels does each agent have wired" rollup for the
+   * admin dashboard's Channels column.
+   *
+   * GET /admin/channel-status?agentGroupIds=<id1>,<id2>,...
+   *   → { status: { [agentGroupId]: { channels: [
+   *         { type, platformId, name, lastActiveAt }, ...
+   *       ] } } }
+   *
+   * Single SQL query across all requested agents (one round trip, no
+   * N+1) — same JOIN as the per-agent /admin/channels/links endpoint
+   * but unrolled into a multi-agent IN(...) clause and grouped on the
+   * client. Each entry carries the most recent session.last_active
+   * tied to that messaging-group + agent pair so the UI can color
+   * the chip ("active <24h" / "stale" / "never").
+   *
+   * The Web channel is included implicitly here only when there's a
+   * messaging_groups row of channel_type='web' for the agent (which
+   * the provision flow always creates), so callers don't need to
+   * special-case it.
+   */
+  interface ChannelStatusEntry {
+    type: string;
+    platformId: string;
+    name: string | null;
+    lastActiveAt: string | null;
+  }
+
+  function handleChannelStatus(res: http.ServerResponse, url: string): void {
+    const parsed = new URL(url, 'http://x');
+    const raw = parsed.searchParams.get('agentGroupIds');
+    if (!raw) {
+      writeJson(res, 400, { error: 'agentGroupIds required' });
+      return;
+    }
+    const ids = raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 500);
+    if (ids.length === 0) {
+      writeJson(res, 200, { status: {} });
+      return;
+    }
+
+    interface Row {
+      agent_group_id: string;
+      channel_type: string;
+      platform_id: string;
+      name: string | null;
+      last_active: string | null;
+    }
+
+    // SQLite has no array-binding for IN clauses — build the placeholder
+    // list ourselves. `ids` is already capped at 500 above.
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = getDb()
+      .prepare(
+        `SELECT mga.agent_group_id AS agent_group_id,
+                mg.channel_type    AS channel_type,
+                mg.platform_id     AS platform_id,
+                mg.name            AS name,
+                (SELECT MAX(s.last_active)
+                   FROM sessions s
+                  WHERE s.agent_group_id     = mga.agent_group_id
+                    AND s.messaging_group_id = mg.id) AS last_active
+           FROM messaging_group_agents mga
+           JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+          WHERE mga.agent_group_id IN (${placeholders})
+          ORDER BY mga.created_at ASC`,
+      )
+      .all(...ids) as Row[];
+
+    const status: Record<string, { channels: ChannelStatusEntry[] }> = {};
+    for (const id of ids) status[id] = { channels: [] };
+    for (const r of rows) {
+      status[r.agent_group_id].channels.push({
+        type: r.channel_type,
+        platformId: r.platform_id,
+        name: r.name,
+        lastActiveAt: r.last_active,
+      });
+    }
+
+    writeJson(res, 200, { status });
   }
 
   /**
