@@ -67,12 +67,14 @@ import {
 import {
   createMessagingGroup,
   createMessagingGroupAgent,
+  getMessagingGroup,
   getMessagingGroupAgentByPair,
   getMessagingGroupByPlatform,
   setMessagingGroupDeniedAt,
   updateMessagingGroup,
 } from '../db/messaging-groups.js';
 import { initGroupFilesystem } from '../group-init.js';
+import { restartAgentGroupContainers } from '../container-restart.js';
 import { addMember } from '../modules/permissions/db/agent-group-members.js';
 import {
   deletePendingChannelApproval,
@@ -1754,6 +1756,19 @@ function createAdapter(): ChannelAdapter | null {
         added_at: now,
       });
 
+      // 3a. Set a human name on the messaging_group BEFORE wiring so the
+      //     auto-created agent_destinations row gets a meaningful local_name
+      //     (e.g. "whatsapp-d-posal") instead of the fallback
+      //     "whatsapp-mg-1779…". createMessagingGroupAgent reads mg.name at
+      //     destination-creation time — naming it later doesn't backfill.
+      //     createMessagingGroupAgent normalizes whatever string we pass.
+      const wg = getMessagingGroup(match.messaging_group_id);
+      if (wg && !wg.name) {
+        updateMessagingGroup(match.messaging_group_id, {
+          name: `whatsapp ${displayName}`,
+        });
+      }
+
       // 3. Wire the (already-created-during-auto-create) messaging_group to
       //    the web user's agent_group. Idempotent if wiring exists.
       if (!getMessagingGroupAgentByPair(match.messaging_group_id, agentGroup.id)) {
@@ -1792,6 +1807,17 @@ function createAdapter(): ChannelAdapter | null {
       } else {
         deletePendingSenderApproval(match.approval_id);
       }
+
+      // 6. Flush stale destinations on any running container for this
+      //    agent_group. The container loads agent_destinations once at
+      //    spawn time and doesn't auto-refresh — without a restart the
+      //    agent keeps replying to the original (web) channel even after
+      //    we've added whatsapp as a destination. Without this restart,
+      //    paired WhatsApp replies go to the user's web tab, not their
+      //    phone (see container/agent-runner/src/destinations.ts and the
+      //    DESTINATION PROJECTION NOTE on createMessagingGroupAgent).
+      //    No wakeMessage → containers come back on the user's next msg.
+      restartAgentGroupContainers(agentGroup.id, 'channel paired (whatsapp)');
 
       writeJson(res, 200, {
         found: true,
@@ -1957,6 +1983,17 @@ function createAdapter(): ChannelAdapter | null {
         added_at: now,
       });
 
+      // Name the messaging_group BEFORE wiring so the auto-created
+      // agent_destinations row gets a meaningful local_name (e.g.
+      // "telegram-d-posal") instead of the fallback "telegram-mg-1779…".
+      // createMessagingGroupAgent normalizes whatever string we pass.
+      const tgMg = getMessagingGroup(match.messaging_group_id);
+      if (tgMg && !tgMg.name) {
+        updateMessagingGroup(match.messaging_group_id, {
+          name: `telegram ${displayName}`,
+        });
+      }
+
       if (!getMessagingGroupAgentByPair(match.messaging_group_id, agentGroup.id)) {
         createMessagingGroupAgent({
           id: `mga-tg-link-${Date.now().toString(36)}`,
@@ -1966,7 +2003,11 @@ function createAdapter(): ChannelAdapter | null {
           engage_pattern: '.',
           sender_scope: 'all',
           ignored_message_policy: 'drop',
-          session_mode: 'shared',
+          // 'agent-shared' so Telegram + Web share one continuous
+          // assistant memory for this user — mirrors the WhatsApp variant.
+          // Prior value 'shared' meant a separate session per (mg, agent),
+          // which forked the agent's memory across channels.
+          session_mode: 'agent-shared',
           priority: 0,
           created_at: now,
         });
@@ -1981,6 +2022,12 @@ function createAdapter(): ChannelAdapter | null {
       } else {
         deletePendingSenderApproval(match.approval_id);
       }
+
+      // Flush stale destinations on running containers — see the WhatsApp
+      // sibling for the rationale. Without this, Telegram replies go to
+      // the user's web tab (the destination cached at the container's
+      // last spawn) instead of back to Telegram. D Posal hit this today.
+      restartAgentGroupContainers(agentGroup.id, 'channel paired (telegram)');
 
       writeJson(res, 200, {
         found: true,
