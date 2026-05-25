@@ -28,7 +28,27 @@ export interface ContainerConfigRow {
   updated_at: string;
 }
 
-export type UnknownSenderPolicy = 'strict' | 'request_approval' | 'public';
+/**
+ * What to do when an unknown sender messages a channel.
+ *
+ * - `strict`           → drop silently. The bot is invisible to
+ *                        anyone not on the access list.
+ * - `request_approval` → queue a card to an admin who decides yes/no.
+ *                        Single-tenant default. NOT suitable for
+ *                        multi-tenant SaaS — see `reply_with_pairing_link`.
+ * - `public`           → any sender can use the agent. No gate.
+ * - `reply_with_pairing_link` → reply once with a self-serve pairing
+ *                        link, drop the message, never auto-create
+ *                        a messaging_group. Multi-tenant SaaS default:
+ *                        the user proves identity by tapping a deep
+ *                        link in the web app, not by waiting on an
+ *                        admin to approve them.
+ */
+export type UnknownSenderPolicy =
+  | 'strict'
+  | 'request_approval'
+  | 'public'
+  | 'reply_with_pairing_link';
 
 export interface MessagingGroup {
   id: string;

@@ -57,6 +57,7 @@ import { DATA_DIR, GROUPS_DIR } from '../config.js';
 const PROJECT_ROOT = path.dirname(GROUPS_DIR);
 import { getDb } from '../db/connection.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../db/agent-groups.js';
+import { createPairing, getPairing, DEFAULT_PAIRING_TTL_MS } from '../db/pending-pairings.js';
 import {
   createContainerConfig,
   deleteContainerConfig,
@@ -598,6 +599,16 @@ function createAdapter(): ChannelAdapter | null {
 
         if (req.method === 'GET' && url.startsWith('/admin/channel-status')) {
           handleChannelStatus(res, url);
+          return;
+        }
+
+        if (req.method === 'POST' && url === '/admin/channels/pair-start') {
+          void handlePairStart(req, res);
+          return;
+        }
+
+        if (req.method === 'GET' && url.startsWith('/admin/channels/pair-status')) {
+          handlePairStatus(res, url);
           return;
         }
 
@@ -2507,6 +2518,107 @@ function createAdapter(): ChannelAdapter | null {
     }
 
     writeJson(res, 200, { status });
+  }
+
+  /**
+   * Issue a one-time pairing code that proves the channel-side
+   * identity (Telegram chat_id, WhatsApp phone, etc.) belongs to a
+   * given web-app agent.
+   *
+   * POST /admin/channels/pair-start
+   *   Body: {
+   *     channelType: 'telegram' | 'whatsapp' | 'whatsapp_cloud' | ...,
+   *     agentGroupId: string,           // the agent to wire on claim
+   *     supabaseUserId?: string,        // web-side user, optional
+   *     displayName?: string             // shown back on claim
+   *   }
+   *   → {
+   *       code: string,                 // 6-char alphanumeric
+   *       deepLink: string | null,      // tappable link if the channel
+   *                                     //   supports one (Telegram does)
+   *       expiresAt: string             // ISO
+   *     }
+   *
+   * The web app shows the deep-link button + code to the user. When
+   * the user sends the code via the channel, the router's pairing
+   * recognizer claims it and creates the wiring atomically (no human
+   * approval needed — see migration 017's doc-comment for why this
+   * replaces the per-stranger approval queue).
+   */
+  async function handlePairStart(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = (await readJsonBody(req).catch(() => null)) as {
+      channelType?: string;
+      agentGroupId?: string;
+      supabaseUserId?: string;
+      displayName?: string;
+    } | null;
+    if (!body || typeof body.channelType !== 'string' || typeof body.agentGroupId !== 'string') {
+      writeJson(res, 400, { error: 'channelType and agentGroupId required' });
+      return;
+    }
+    const ag = getAgentGroup(body.agentGroupId);
+    if (!ag) {
+      writeJson(res, 404, { error: 'agent_group not found' });
+      return;
+    }
+
+    const pairing = createPairing({
+      channelType: body.channelType,
+      agentGroupId: body.agentGroupId,
+      supabaseUserId: body.supabaseUserId,
+      displayName: body.displayName,
+    });
+
+    writeJson(res, 200, {
+      code: pairing.code,
+      deepLink: buildDeepLink(body.channelType, pairing.code),
+      expiresAt: pairing.expires_at,
+      ttlMs: DEFAULT_PAIRING_TTL_MS,
+    });
+  }
+
+  /**
+   * Poll a pairing's status. The web app calls this every ~2s after
+   * showing the user the deep-link button; on `claimed=true` it
+   * redirects to /chat with a success toast.
+   *
+   * GET /admin/channels/pair-status?code=<code>
+   *   → { found: bool, claimed: bool, claimedAt?: string,
+   *       expired?: bool, channelType?: string }
+   */
+  function handlePairStatus(res: http.ServerResponse, url: string): void {
+    const parsed = new URL(url, 'http://x');
+    const code = parsed.searchParams.get('code');
+    if (!code) {
+      writeJson(res, 400, { error: 'code required' });
+      return;
+    }
+    const row = getPairing(code.toUpperCase());
+    if (!row) {
+      writeJson(res, 200, { found: false, claimed: false });
+      return;
+    }
+    const expired = !row.claimed_at && Date.parse(row.expires_at) < Date.now();
+    writeJson(res, 200, {
+      found: true,
+      claimed: !!row.claimed_at,
+      claimedAt: row.claimed_at,
+      expired,
+      channelType: row.channel_type,
+    });
+  }
+
+  /** Build a tappable channel-specific deep link for the user. Returns
+   * null for channels that don't have one (in which case the UI shows
+   * the bare code for copy/paste). */
+  function buildDeepLink(channelType: string, code: string): string | null {
+    const botUsername = process.env.TELEGRAM_BOT_USERNAME;
+    if (channelType === 'telegram' && botUsername) {
+      return `https://t.me/${botUsername}?start=${code}`;
+    }
+    // Telegram without TELEGRAM_BOT_USERNAME set, and all other channels,
+    // fall back to copy/paste UX on the solelaclawde side.
+    return null;
   }
 
   /**

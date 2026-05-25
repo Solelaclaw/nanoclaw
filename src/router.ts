@@ -21,8 +21,10 @@ import { getChannelAdapter } from './channels/channel-registry.js';
 import { gateCommand } from './command-gate.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
+import { claimPairing, extractPairingCode } from './db/pending-pairings.js';
 import {
   createMessagingGroup,
+  createMessagingGroupAgent,
   getMessagingGroupAgents,
   getMessagingGroupWithAgentCount,
 } from './db/messaging-groups.js';
@@ -33,7 +35,7 @@ import { resolveSession, writeSessionMessage, writeOutboundDirect } from './sess
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
-import type { InboundEvent } from './channels/adapter.js';
+import type { ChannelAdapter, InboundEvent } from './channels/adapter.js';
 
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -168,6 +170,27 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   }
 
   const isMention = event.message.isMention === true;
+
+  // 0b. Pairing-code recognition. Before any messaging_group lookup,
+  //     check if the inbound message is a pairing code (Telegram
+  //     `/start <code>`, or a bare 6-char alphanumeric on its own
+  //     line on any channel). If yes and the code exists + is valid
+  //     for this channel type → atomically claim it, create the
+  //     messaging_group + wiring, and confirm in-channel. No
+  //     downstream routing; this turn IS the pairing handshake.
+  //
+  //     We do this BEFORE the regular lookup so that a code sent on a
+  //     channel that already has a different unwired messaging_group
+  //     still completes the pairing. The code is the source of truth
+  //     for identity.
+  const earlyParsed = safeParseContent(event.message.content);
+  const code = earlyParsed.text ? extractPairingCode(earlyParsed.text) : null;
+  if (code) {
+    const handled = await tryClaimPairing(code, event, adapter ?? null);
+    if (handled) return;
+    // Code didn't match or was invalid — fall through to normal routing,
+    // which will likely drop or escalate per the messaging_group's policy.
+  }
 
   // 1. Combined lookup: messaging_group row + count of wired agents in a
   //    single query. Cheap short-circuit for the common "unwired channel"
@@ -493,4 +516,126 @@ async function deliverToAgent(
 function messageIdForAgent(baseId: string | undefined, agentGroupId: string): string {
   const id = baseId && baseId.length > 0 ? baseId : generateId();
   return `${id}:${agentGroupId}`;
+}
+
+/**
+ * Try to consume `code` as a pairing code for this inbound event.
+ *
+ * On success:
+ *   - The pending_pairing row is marked claimed (atomic — racing claims
+ *     lose cleanly, see claimPairing()).
+ *   - We create or reuse the messaging_group for this (channelType,
+ *     platformId), then insert a messaging_group_agents wiring linking
+ *     it to the pre-bound agent_group_id from the pairing row.
+ *   - We send a brief in-channel confirmation reply via the adapter.
+ *   - Returns true so the caller skips normal routing for this turn.
+ *     The pairing code itself is not a "real" user message; treating it
+ *     as one would feed the agent garbage on first contact.
+ *
+ * On any failure (no code, expired, wrong channel, already claimed):
+ *   Returns false — the caller falls through to normal routing, which
+ *   will likely drop the message (it's just a 6-char string the user
+ *   sent to a bot they're not paired with).
+ */
+async function tryClaimPairing(
+  code: string,
+  event: InboundEvent,
+  adapter: ChannelAdapter | null,
+): Promise<boolean> {
+  const result = claimPairing(code, event.channelType, event.platformId);
+  if (!result.ok || !result.pairing) {
+    log.debug('Pairing code rejected', {
+      code,
+      reason: result.reason,
+      channelType: event.channelType,
+      platformId: event.platformId,
+    });
+    return false;
+  }
+
+  const pairing = result.pairing;
+
+  // Look up (or create) the messaging_group for this channel + platform.
+  // For the common "user DMs the bot for the first time with /start CODE"
+  // path, no row exists yet. For the recovery case (a row was auto-created
+  // earlier with no wiring), we reuse it so we don't end up with two rows
+  // for the same chat.
+  const existing = getMessagingGroupWithAgentCount(event.channelType, event.platformId);
+  let mg: MessagingGroup;
+  if (existing) {
+    mg = existing.mg;
+  } else {
+    const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    mg = {
+      id: mgId,
+      channel_type: event.channelType,
+      platform_id: event.platformId,
+      name: pairing.display_name ?? null,
+      is_group: event.message.isGroup ? 1 : 0,
+      unknown_sender_policy: 'reply_with_pairing_link',
+      denied_at: null,
+      created_at: new Date().toISOString(),
+    };
+    createMessagingGroup(mg);
+  }
+
+  // Create the wiring. If one somehow already exists for this exact pair
+  // (re-claim race after partial completion), the UNIQUE constraint will
+  // throw — we swallow it and treat as success.
+  try {
+    createMessagingGroupAgent({
+      id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      messaging_group_id: mg.id,
+      agent_group_id: pairing.agent_group_id,
+      // DM channels — every inbound message is "for the agent". Mention
+      // semantics don't apply here (there are no other members to direct
+      // a message at), so engage_mode='mention' with the channel being
+      // a DM is the right default — it matches the auto-create behavior
+      // for first-touch DMs elsewhere in the router.
+      engage_mode: 'mention',
+      engage_pattern: null,
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'agent-shared',
+      priority: 100,
+      created_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    if (!String(err).includes('UNIQUE')) throw err;
+    log.debug('Wiring already existed for paired chat — treating claim as success', {
+      messagingGroupId: mg.id,
+      agentGroupId: pairing.agent_group_id,
+    });
+  }
+
+  log.info('Pairing claimed', {
+    code,
+    channelType: event.channelType,
+    platformId: event.platformId,
+    agentGroupId: pairing.agent_group_id,
+    messagingGroupId: mg.id,
+  });
+
+  // Confirm in-channel so the user gets immediate feedback. Failure
+  // here is non-fatal — the wiring is already in place; their next
+  // message will route normally.
+  if (adapter) {
+    const greeting = pairing.display_name
+      ? `✅ Connected. I'm now wired to ${pairing.display_name}'s assistant. Send me a message to get started.`
+      : `✅ Connected. Send me a message to get started.`;
+    try {
+      await adapter.deliver(event.platformId, null, {
+        kind: 'chat',
+        content: { text: greeting },
+      });
+    } catch (err) {
+      log.warn('Pairing confirmation send failed', {
+        channelType: event.channelType,
+        platformId: event.platformId,
+        err,
+      });
+    }
+  }
+
+  return true;
 }

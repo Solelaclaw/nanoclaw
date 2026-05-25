@@ -31,6 +31,7 @@ import fs from 'fs';
 
 import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { purgeExpiredPairings } from './db/pending-pairings.js';
 import {
   countDueMessages,
   deleteOrphanProcessingClaims,
@@ -139,6 +140,16 @@ async function sweep(): Promise<void> {
     }
   } catch (err) {
     log.error('Host sweep error', { err });
+  }
+
+  // Drop expired-and-unclaimed pairing codes so the table doesn't
+  // accumulate forever. Claimed rows stay for audit. Non-fatal — a
+  // failure here just delays cleanup to the next tick.
+  try {
+    const purged = purgeExpiredPairings();
+    if (purged > 0) log.debug('Purged expired pairing codes', { count: purged });
+  } catch (err) {
+    log.warn('Pairing-codes purge error', { err });
   }
 
   setTimeout(sweep, SWEEP_INTERVAL_MS);
