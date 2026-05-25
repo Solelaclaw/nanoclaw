@@ -19,8 +19,10 @@
  */
 import { getChannelAdapter } from './channels/channel-registry.js';
 import { gateCommand } from './command-gate.js';
+import { getDb } from './db/connection.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
+import { readEnvFile } from './env.js';
 import {
   createMessagingGroup,
   getMessagingGroupAgents,
@@ -33,7 +35,7 @@ import { resolveSession, writeSessionMessage, writeOutboundDirect } from './sess
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
-import type { InboundEvent } from './channels/adapter.js';
+import type { ChannelAdapter, InboundEvent } from './channels/adapter.js';
 
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -243,6 +245,21 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
         platformId: event.platformId,
       });
     }
+
+    // SoleLaClawde multi-tenant: when the SaaS public URL is configured,
+    // auto-reply in-channel pointing the user at the web pairing page.
+    // Without this, cold-DM users sit in pending_channel_approvals
+    // forever waiting for nobody to claim them. Idempotent — only sent
+    // on the first inbound for this messaging_group (the approval-row
+    // creation in channelRequestGate is what we key on, but we record
+    // our own dropped_messages entry above so we can also use it as
+    // the "have we replied?" marker — see sendPairingReplyOnce).
+    if (adapter) {
+      void sendPairingReplyOnce(mg, event, adapter).catch((err) =>
+        log.warn('Pairing-reply auto-send failed', { messagingGroupId: mg.id, err }),
+      );
+    }
+
     return;
   }
 
@@ -493,4 +510,69 @@ async function deliverToAgent(
 function messageIdForAgent(baseId: string | undefined, agentGroupId: string): string {
   const id = baseId && baseId.length > 0 ? baseId : generateId();
   return `${id}:${agentGroupId}`;
+}
+
+/**
+ * Cold-DM auto-reply: when an unknown sender first hits a Telegram /
+ * WhatsApp channel that has no wirings yet, send a single in-channel
+ * message pointing them at the web pairing page. Without this, the user
+ * messages the bot, gets queued in pending_channel_approvals, and just
+ * sees silence until someone manually wires them.
+ *
+ * Multi-tenant SaaS only — gated on the `SOLELACLAWDE_PUBLIC_URL` env
+ * var. Self-hosted single-tenant installs that don't set it skip this
+ * branch entirely and keep the original "queue an approval, owner
+ * eventually claims" flow.
+ *
+ * Idempotency: we want to send at most ONE reply per messaging_group,
+ * even if the user keeps DMing. We use the count of `dropped_messages`
+ * rows for this messaging_group as our cheap "have we already
+ * replied?" signal — the call site above always records a drop right
+ * before us, so on the very first inbound the count is exactly 1 and
+ * we reply; on subsequent inbounds the count is >= 2 and we skip.
+ */
+async function sendPairingReplyOnce(
+  mg: MessagingGroup,
+  event: InboundEvent,
+  adapter: ChannelAdapter,
+): Promise<void> {
+  // Only Telegram + WhatsApp need this. Web / Slack / Discord / etc.
+  // either don't have a cold-DM problem or have channel-specific
+  // patterns we'd want to design separately.
+  const supported = new Set(['telegram', 'whatsapp', 'whatsapp_cloud']);
+  if (!supported.has(event.channelType)) return;
+
+  const env = readEnvFile(['SOLELACLAWDE_PUBLIC_URL']);
+  const publicUrl = env.SOLELACLAWDE_PUBLIC_URL;
+  if (!publicUrl) return;
+
+  // Dedup: only reply on the *first* drop for this messaging_group.
+  // The drop count includes the row we just recorded for this same
+  // event, so the first-time count is 1.
+  const dropCount = (
+    getDb()
+      .prepare(`SELECT COUNT(*) AS c FROM dropped_messages WHERE messaging_group_id = ?`)
+      .get(mg.id) as { c: number } | undefined
+  )?.c ?? 0;
+  if (dropCount !== 1) return;
+
+  const channelPath = event.channelType.startsWith('whatsapp') ? 'whatsapp' : 'telegram';
+  const pairingUrl = `${publicUrl.replace(/\/$/, '')}/channels/${channelPath}`;
+  const text = `👋 Welcome — to use me as your assistant, set up your account at ${pairingUrl}. You'll get a code to paste back here.`;
+
+  try {
+    await adapter.deliver(event.platformId, null, {
+      kind: 'chat',
+      content: { text },
+    });
+    log.info('Pairing-reply sent', {
+      messagingGroupId: mg.id,
+      channelType: event.channelType,
+      platformId: event.platformId,
+    });
+  } catch (err) {
+    // Non-fatal — the approval still got queued, the user can still
+    // pair through the normal /channels page if they discover it.
+    log.warn('Pairing-reply deliver failed', { messagingGroupId: mg.id, err });
+  }
 }
