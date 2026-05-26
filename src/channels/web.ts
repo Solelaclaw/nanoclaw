@@ -1101,12 +1101,25 @@ function createAdapter(): ChannelAdapter | null {
       // inlines them as CLAUDE.md fragments. Idempotent — re-provisioning
       // an existing agent with new template content updates the values
       // in place (covers "buyer upgrades to a newer template publication").
+      //
+      // Restart-after-update: composeGroupClaudeMd runs at spawn time,
+      // so a warm container keeps its cached CLAUDE.md even after we
+      // write the new values to the DB. Without a restart, the next
+      // user message uses the OLD skill — the visitor clicks "Use this
+      // agent" on solela.ai and thinks it didn't work. Same pattern as
+      // the WhatsApp/Telegram pairing flow (lines ~1872, ~2082): when
+      // wiring changes invalidate the running container's view of the
+      // world, restart immediately so the next message wakes a fresh
+      // container that reads the new state. Fire-and-forget — the
+      // restart is best-effort, and a slow/failed restart still leaves
+      // the next idle-timeout cycle as the fallback.
       if (customSkillMarkdown !== undefined || customPersona !== undefined) {
         ensureContainerConfig(ag.id);
         updateContainerConfigScalars(ag.id, {
           ...(customSkillMarkdown !== undefined ? { custom_skill_md: customSkillMarkdown } : {}),
           ...(customPersona !== undefined ? { custom_persona: customPersona } : {}),
         });
+        restartAgentGroupContainers(ag.id, 'marketplace skill/persona updated');
       }
 
       // 3. Membership row — gives the user access without granting admin.
