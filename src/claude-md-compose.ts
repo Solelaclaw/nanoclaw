@@ -133,6 +133,29 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
     }
   }
 
+  // V3 marketplace — custom skill body and persona, both authored by
+  // the agent's seller on the Solela marketplace. They land here at
+  // provision time via the bridge's POST /admin/provision payload
+  // and are stored on container_configs (see migration 017).
+  //
+  // We write them as `aa-` and `ab-` prefixed fragment files so they
+  // sort BEFORE the alphabetically-later built-in skill/module
+  // fragments — the marketplace skill defines the agent's identity
+  // and should anchor the system prompt before standard utility
+  // instructions layer on top.
+  if (configRow?.custom_persona && configRow.custom_persona.trim()) {
+    desired.set('aa-marketplace-persona.md', {
+      type: 'inline',
+      content: configRow.custom_persona.trim(),
+    });
+  }
+  if (configRow?.custom_skill_md && configRow.custom_skill_md.trim()) {
+    desired.set('ab-marketplace-skill.md', {
+      type: 'inline',
+      content: configRow.custom_skill_md.trim(),
+    });
+  }
+
   // Reconcile: drop stale, write desired.
   for (const existing of fs.readdirSync(fragmentsDir)) {
     if (!desired.has(existing)) {

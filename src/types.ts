@@ -25,6 +25,11 @@ export interface ContainerConfigRow {
   packages_npm: string; // JSON: string[]
   additional_mounts: string; // JSON: AdditionalMountConfig[]
   cli_scope: string; // 'disabled' | 'group' | 'global'
+  /** V3 marketplace — author-authored skill body. Inlined into the
+   *  agent's CLAUDE.md at every spawn alongside standard skills. */
+  custom_skill_md: string | null;
+  /** V3 marketplace — author-authored persona / voice fragment. */
+  custom_persona: string | null;
   updated_at: string;
 }
 

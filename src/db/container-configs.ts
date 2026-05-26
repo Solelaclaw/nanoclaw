@@ -9,6 +9,11 @@ const SCALAR_COLUMNS = new Set([
   'assistant_name',
   'max_messages_per_prompt',
   'cli_scope',
+  // V3 — marketplace agents inject author-authored skill body and
+  // persona at provision time. Both are nullable TEXT; read by
+  // composeGroupClaudeMd to inline into the agent's CLAUDE.md.
+  'custom_skill_md',
+  'custom_persona',
 ]);
 const JSON_COLUMNS = new Set(['skills', 'mcp_servers', 'packages_apt', 'packages_npm', 'additional_mounts']);
 
@@ -55,7 +60,15 @@ export function updateContainerConfigScalars(
   updates: Partial<
     Pick<
       ContainerConfigRow,
-      'provider' | 'model' | 'effort' | 'image_tag' | 'assistant_name' | 'max_messages_per_prompt' | 'cli_scope'
+      | 'provider'
+      | 'model'
+      | 'effort'
+      | 'image_tag'
+      | 'assistant_name'
+      | 'max_messages_per_prompt'
+      | 'cli_scope'
+      | 'custom_skill_md'
+      | 'custom_persona'
     >
   >,
 ): void {
