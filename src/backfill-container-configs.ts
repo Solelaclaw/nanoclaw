@@ -65,6 +65,10 @@ export function backfillContainerConfigs(): void {
       packages_npm: JSON.stringify(legacy.packages?.npm ?? []),
       additional_mounts: JSON.stringify(legacy.additionalMounts ?? []),
       cli_scope: 'group',
+      // V3 marketplace fields — null for legacy backfilled rows.
+      // Only marketplace-provisioned agents populate these.
+      custom_skill_md: null,
+      custom_persona: null,
       updated_at: new Date().toISOString(),
     };
 

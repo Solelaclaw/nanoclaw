@@ -63,6 +63,7 @@ import {
   ensureContainerConfig,
   getContainerConfig,
   updateContainerConfigJson,
+  updateContainerConfigScalars,
 } from '../db/container-configs.js';
 import {
   createMessagingGroup,
@@ -895,6 +896,15 @@ function createAdapter(): ChannelAdapter | null {
        * Solelaclawde is responsible for sending the right list at
        * provision time based on Organization.kind. */
       skills?: unknown;
+      /** V3 marketplace — author-authored skill body and persona for
+       *  agents provisioned from a Solela marketplace template. Both
+       *  optional; stored on container_configs and inlined into the
+       *  agent's CLAUDE.md at every spawn (see
+       *  src/claude-md-compose.ts). When omitted, the agent uses
+       *  only the built-in skill set from `skills` above + the
+       *  default `instructions` body. */
+      customSkillMarkdown?: unknown;
+      customPersona?: unknown;
     };
     try {
       body = (await readJsonBody(req)) as typeof body;
@@ -920,6 +930,34 @@ function createAdapter(): ChannelAdapter | null {
         return;
       }
       skills = body.skills as string[];
+    }
+
+    // V3 marketplace — validate the custom skill body + persona.
+    let customSkillMarkdown: string | undefined;
+    if (body.customSkillMarkdown !== undefined) {
+      if (typeof body.customSkillMarkdown !== 'string') {
+        writeJson(res, 400, { error: 'customSkillMarkdown must be a string' });
+        return;
+      }
+      // Cap at 20KB — the same limit the marketplace's Prisma schema
+      // enforces. Anything beyond is almost certainly an injection.
+      if (body.customSkillMarkdown.length > 20000) {
+        writeJson(res, 400, { error: 'customSkillMarkdown exceeds 20000 chars' });
+        return;
+      }
+      customSkillMarkdown = body.customSkillMarkdown;
+    }
+    let customPersona: string | undefined;
+    if (body.customPersona !== undefined) {
+      if (typeof body.customPersona !== 'string') {
+        writeJson(res, 400, { error: 'customPersona must be a string' });
+        return;
+      }
+      if (body.customPersona.length > 4000) {
+        writeJson(res, 400, { error: 'customPersona exceeds 4000 chars' });
+        return;
+      }
+      customPersona = body.customPersona;
     }
     // Per-user instructions teach the agent the in-conversation tool-connect
     // pattern: any request that would need an external service maps to a
@@ -1055,6 +1093,20 @@ function createAdapter(): ChannelAdapter | null {
       if (skills) {
         ensureContainerConfig(ag.id);
         updateContainerConfigJson(ag.id, 'skills', skills);
+      }
+
+      // V3 marketplace — apply the author-authored skill body and persona
+      // if the caller provided them. Stored on container_configs and
+      // read at every container spawn by composeGroupClaudeMd, which
+      // inlines them as CLAUDE.md fragments. Idempotent — re-provisioning
+      // an existing agent with new template content updates the values
+      // in place (covers "buyer upgrades to a newer template publication").
+      if (customSkillMarkdown !== undefined || customPersona !== undefined) {
+        ensureContainerConfig(ag.id);
+        updateContainerConfigScalars(ag.id, {
+          ...(customSkillMarkdown !== undefined ? { custom_skill_md: customSkillMarkdown } : {}),
+          ...(customPersona !== undefined ? { custom_persona: customPersona } : {}),
+        });
       }
 
       // 3. Membership row — gives the user access without granting admin.
