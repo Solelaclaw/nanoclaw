@@ -22,6 +22,7 @@ import {
 } from './db/session-db.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
+import { rewriteConnectUrls } from './connect-url-rewrite.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
@@ -353,12 +354,20 @@ async function deliverMessage(
       ? readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[])
       : undefined;
 
+  // Rewrite any OneCLI/localhost connect URLs in the message body to
+  // the public solelaclawde proxy. Runs BEFORE the channel adapter
+  // sees the content so WhatsApp / Telegram / Slack / web / etc. all
+  // receive the canonical URL. See connect-url-rewrite.ts for the
+  // pattern matched. Pure transform — no-op if no connect URL present
+  // (fast path).
+  const rewrittenContent = rewriteConnectUrls(msg.content);
+
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channel_type,
     msg.platform_id,
     msg.thread_id,
     msg.kind,
-    msg.content,
+    rewrittenContent,
     files,
   );
   log.info('Message delivered', {

@@ -48,6 +48,7 @@ import BetterSqlite3 from 'better-sqlite3';
 import qrcode from 'qrcode';
 
 import { log } from '../log.js';
+import { WEB_BASE_URL } from '../connect-url-rewrite.js';
 import { readEnvFile } from '../env.js';
 import { DATA_DIR, GROUPS_DIR } from '../config.js';
 
@@ -93,17 +94,10 @@ const CHANNEL_TYPE = 'web';
 const DEFAULT_PORT = 11000;
 const DEFAULT_HOST = '127.0.0.1';
 
-/** Read once at module load — base URL of the solelaclawde web app that hosts
- * the /api/connect/* OAuth proxy. The promoter uses this to rewrite agent-
- * surfaced URLs onto our domain. Same variable name as the web app's env so
- * the two sides stay in sync.
- *
- * The legacy `SOLELACLAWDE_WEB_BASE_URL` is read as a fallback for installs
- * predating the rename. */
-const WEB_BASE_URL = (() => {
-  const env = readEnvFile(['SOLELACLAWDE_PUBLIC_URL', 'SOLELACLAWDE_WEB_BASE_URL']);
-  return (env.SOLELACLAWDE_PUBLIC_URL ?? env.SOLELACLAWDE_WEB_BASE_URL ?? 'http://localhost:3000').replace(/\/+$/, '');
-})();
+// WEB_BASE_URL imported at top alongside the other module-scope
+// imports — kept as the host-wide single source of truth so this
+// channel's card-lift uses the exact same value as
+// delivery.ts's rewriteConnectUrls.
 
 /**
  * Folder name of the "template" agent group whose filesystem + container
