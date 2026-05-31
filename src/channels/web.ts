@@ -84,10 +84,17 @@ import {
 } from '../modules/permissions/db/pending-channel-approvals.js';
 import { deletePendingSenderApproval } from '../modules/permissions/db/pending-sender-approvals.js';
 import { upsertUser } from '../modules/permissions/db/users.js';
-import { getPendingApproval, getPendingApprovalsForWebUser } from '../db/sessions.js';
+import {
+  deletePendingQuestion,
+  getPendingApproval,
+  getPendingApprovalsForWebUser,
+  getPendingQuestion,
+  getPendingQuestionsForWebUser,
+  getSession,
+} from '../db/sessions.js';
 import { resolveOneCLIApproval } from '../modules/approvals/onecli-approvals.js';
 import { routeInbound } from '../router.js';
-import { resolveSession } from '../session-manager.js';
+import { resolveSession, writeSessionMessage } from '../session-manager.js';
 import { wakeContainer } from '../container-runner.js';
 import type { ChannelAdapter, ChannelSetup, DeliveryAddress, InboundEvent, OutboundMessage } from './adapter.js';
 import { getRegisteredChannelNames, registerChannelAdapter } from './channel-registry.js';
@@ -661,6 +668,26 @@ function createAdapter(): ChannelAdapter | null {
 
         if (req.method === 'POST' && url === '/admin/onecli-approvals/decide') {
           void handleDecideOneCliApproval(req, res);
+          return;
+        }
+
+        // Agent-asked questions (ask_user_question MCP tool). Distinct
+        // from OneCLI approvals above — those are server-gated outbound
+        // requests, these are agent-initiated yes/no/multi-choice
+        // prompts the LLM itself emits inline in a turn. Same
+        // surfacing pattern (poll + decide via HTTP) so the Solela
+        // chat client can re-use the card UI it already has for
+        // approvals.
+        if (
+          req.method === 'GET' &&
+          (url === '/admin/agent-questions/pending' || url.startsWith('/admin/agent-questions/pending?'))
+        ) {
+          handleListAgentQuestions(res, url);
+          return;
+        }
+
+        if (req.method === 'POST' && url === '/admin/agent-questions/answer') {
+          void handleAnswerAgentQuestion(req, res);
           return;
         }
 
@@ -2468,6 +2495,134 @@ function createAdapter(): ChannelAdapter | null {
       userId: typeof body.userId === 'string' ? body.userId : undefined,
     });
     writeJson(res, 200, { ok: true, approvalId: body.approvalId, decision: body.decision });
+  }
+
+  /**
+   * GET /admin/agent-questions/pending?userId=<id>
+   *
+   * Returns the user's pending ask_user_question rows — agent-asked
+   * binary / multi-choice prompts waiting for a click. The Solela
+   * chat client polls this on page load + after each turn and
+   * renders inline question cards alongside OneCLI approval cards
+   * (separate concept, same surfacing pattern).
+   */
+  function handleListAgentQuestions(res: http.ServerResponse, url: string): void {
+    const parsed = new URL(url, 'http://placeholder');
+    const userId = parsed.searchParams.get('userId');
+    if (!userId) {
+      writeJson(res, 400, { error: 'userId query param required' });
+      return;
+    }
+    const rows = getPendingQuestionsForWebUser(userId);
+    const questions = rows.map((row) => ({
+      questionId: row.question_id,
+      title: row.title,
+      // The container's ask_user_question tool stores the question
+      // text inside the outbound message content, not in pending_questions
+      // (which holds the render metadata for the response handler).
+      // For the UI we expose title + options; if a richer question
+      // body is ever needed we can fan out from message_out_id.
+      options: row.options,
+      createdAt: row.created_at,
+      sessionId: row.session_id,
+    }));
+    writeJson(res, 200, { questions });
+  }
+
+  /**
+   * POST /admin/agent-questions/answer
+   *
+   * Body: `{ questionId: string, selectedOption: string, userId?: string }`
+   *
+   * Forwards the user's click to the container by writing a
+   * `question_response` system message to the session's inbound.db
+   * and waking the container. Mirrors the
+   * `handleInteractiveResponse` flow in
+   * `src/modules/interactive/index.ts` (which the chat-sdk-bridge
+   * `onAction` calls for Telegram/Slack/etc. clicks) — but invoked
+   * directly here so the web channel doesn't need to round-trip
+   * through chat-sdk.
+   *
+   * The container's blocking `ask_user_question` tool picks up the
+   * response on its next poll iteration and returns the selected
+   * option to the LLM, which then continues the turn.
+   */
+  async function handleAnswerAgentQuestion(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    let body: { questionId?: unknown; selectedOption?: unknown; userId?: unknown };
+    try {
+      body = (await readJsonBody(req)) as typeof body;
+    } catch (err) {
+      writeJson(res, 400, { error: 'invalid json', detail: (err as Error).message });
+      return;
+    }
+    if (typeof body.questionId !== 'string' || !body.questionId) {
+      writeJson(res, 400, { error: 'questionId required' });
+      return;
+    }
+    if (typeof body.selectedOption !== 'string' || !body.selectedOption) {
+      writeJson(res, 400, { error: 'selectedOption required' });
+      return;
+    }
+
+    const pq = getPendingQuestion(body.questionId);
+    if (!pq) {
+      writeJson(res, 404, { error: 'question not found or already answered' });
+      return;
+    }
+
+    // Cross-user guard: when userId is passed, the question must
+    // belong to that user's web channel. Defence-in-depth — even if
+    // the client somehow holds another user's questionId from a
+    // stale tab, the answer can't be hijacked.
+    if (typeof body.userId === 'string' && body.userId) {
+      const expected = `web:${body.userId}`;
+      if (pq.channel_type !== 'web' || pq.platform_id !== expected) {
+        writeJson(res, 403, {
+          error: 'question does not belong to this user',
+        });
+        return;
+      }
+    }
+
+    const session = getSession(pq.session_id);
+    if (!session) {
+      // Session was deleted between question creation and answer.
+      // Drop the orphan row so it doesn't haunt subsequent polls.
+      deletePendingQuestion(body.questionId);
+      writeJson(res, 410, { error: 'session is gone; question discarded' });
+      return;
+    }
+
+    const userId = typeof body.userId === 'string' ? body.userId : '';
+    writeSessionMessage(session.agent_group_id, session.id, {
+      id: `qr-${body.questionId}-${Date.now()}`,
+      kind: 'system',
+      timestamp: new Date().toISOString(),
+      platformId: pq.platform_id,
+      channelType: pq.channel_type,
+      threadId: pq.thread_id,
+      content: JSON.stringify({
+        type: 'question_response',
+        questionId: body.questionId,
+        selectedOption: body.selectedOption,
+        userId,
+      }),
+    });
+
+    deletePendingQuestion(body.questionId);
+    await wakeContainer(session);
+
+    log.info('Agent question answered via web', {
+      questionId: body.questionId,
+      selectedOption: body.selectedOption,
+      sessionId: session.id,
+      userId,
+    });
+    writeJson(res, 200, {
+      ok: true,
+      questionId: body.questionId,
+      selectedOption: body.selectedOption,
+    });
   }
 
   /**

@@ -136,6 +136,29 @@ export function deletePendingQuestion(questionId: string): void {
   getDb().prepare('DELETE FROM pending_questions WHERE question_id = ?').run(questionId);
 }
 
+/**
+ * Find pending ask_user_question rows routed to a specific user's
+ * web channel (platform_id = `web:<userId>`). Used by the Solela web
+ * chat to surface agent-asked questions inline as Yes/No (or
+ * multi-option) cards. Sibling to `getPendingApprovalsForWebUser`
+ * (the OneCLI-credential equivalent) — same channel/platform_id
+ * filter, different table.
+ */
+export function getPendingQuestionsForWebUser(userId: string): PendingQuestion[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT * FROM pending_questions
+       WHERE channel_type = 'web'
+         AND platform_id = ?
+       ORDER BY created_at ASC`,
+    )
+    .all(`web:${userId}`) as Array<Omit<PendingQuestion, 'options'> & { options_json: string }>;
+  return rows.map((row) => {
+    const { options_json, ...rest } = row;
+    return { ...rest, options: JSON.parse(options_json) };
+  });
+}
+
 // ── Pending Approvals ──
 
 /**
