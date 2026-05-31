@@ -48,6 +48,7 @@ import {
   writeSessionRouting,
 } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
+import { getMessagingGroup } from './db/messaging-groups.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
@@ -145,6 +146,7 @@ async function spawnContainer(session: Session): Promise<void> {
     containerConfig,
     provider,
     contribution,
+    session,
     agentIdentifier,
   );
 
@@ -405,6 +407,7 @@ async function buildContainerArgs(
   containerConfig: import('./container-config.js').ContainerConfig,
   provider: string,
   providerContribution: ProviderContainerContribution,
+  session: Session,
   agentIdentifier?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
@@ -435,6 +438,38 @@ async function buildContainerArgs(
     '-e',
     `SOLELACLAWDE_API_URL=${process.env.SOLELACLAWDE_API_URL ?? 'https://app.solela.ai'}`,
   );
+
+  // OpenTelemetry — let the agent-runner inside the container emit
+  // per-channel / per-model token + cost metrics. Container-shape
+  // identity becomes resource attributes on every datapoint;
+  // OTLP transport env (endpoint + optional headers) pass through
+  // so swapping backends doesn't need a container rebuild.
+  args.push('-e', `NANOCLAW_AGENT_GROUP_ID=${session.agent_group_id}`);
+  args.push('-e', `NANOCLAW_SESSION_ID=${session.id}`);
+  if (session.messaging_group_id) {
+    const mg = getMessagingGroup(session.messaging_group_id);
+    if (mg?.channel_type) {
+      args.push('-e', `NANOCLAW_CHANNEL_TYPE=${mg.channel_type}`);
+    }
+  }
+  if (process.env.OTEL_EXPORTER_OTLP_ENDPOINT) {
+    args.push(
+      '-e',
+      `OTEL_EXPORTER_OTLP_ENDPOINT=${process.env.OTEL_EXPORTER_OTLP_ENDPOINT}`,
+    );
+  }
+  if (process.env.OTEL_EXPORTER_OTLP_HEADERS) {
+    args.push(
+      '-e',
+      `OTEL_EXPORTER_OTLP_HEADERS=${process.env.OTEL_EXPORTER_OTLP_HEADERS}`,
+    );
+  }
+  if (process.env.NANOCLAW_AGENT_RUNNER_VERSION) {
+    args.push(
+      '-e',
+      `NANOCLAW_AGENT_RUNNER_VERSION=${process.env.NANOCLAW_AGENT_RUNNER_VERSION}`,
+    );
+  }
 
   // Apollo API key — used by the apollo_search_prospects /
   // apollo_enrich_person MCP tools. The host-side env is the source of
