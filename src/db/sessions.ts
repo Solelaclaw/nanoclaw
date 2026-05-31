@@ -193,6 +193,27 @@ export function getPendingApprovalsByAction(action: string): PendingApproval[] {
 }
 
 /**
+ * Find pending approvals that were routed to a specific user's web
+ * channel (platform_id matches `web:<userId>`). Used by the Solela
+ * web chat to surface OneCLI approval cards inline in the thread:
+ * the chat client polls this on page load + after each turn instead
+ * of receiving them as regular chat messages. Returns only `pending`
+ * status — resolved/expired rows have already been actioned and
+ * shouldn't reappear in the UI.
+ */
+export function getPendingApprovalsForWebUser(userId: string): PendingApproval[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM pending_approvals
+       WHERE channel_type = 'web'
+         AND platform_id = ?
+         AND status = 'pending'
+       ORDER BY created_at ASC`,
+    )
+    .all(`web:${userId}`) as PendingApproval[];
+}
+
+/**
  * Resolve ask_question render metadata (title + normalized options) for any
  * card, regardless of whether it was persisted as a pending_question (generic
  * ask_user_question) or a pending_approval (self-mod / OneCLI credential).

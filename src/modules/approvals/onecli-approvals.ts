@@ -22,6 +22,7 @@ import { OneCLI, type ApprovalRequest, type ManualApprovalHandle } from '@onecli
 import { pickApprovalDelivery, pickApprover } from './primitive.js';
 import { ONECLI_API_KEY, ONECLI_URL } from '../../config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
+import { getMessagingGroupsByAgentGroup } from '../../db/messaging-groups.js';
 import {
   createPendingApproval,
   deletePendingApproval,
@@ -30,7 +31,7 @@ import {
 } from '../../db/sessions.js';
 import type { ChannelDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
-import type { PendingApproval } from '../../types.js';
+import type { MessagingGroup, PendingApproval } from '../../types.js';
 
 export const ONECLI_ACTION = 'onecli_credential';
 
@@ -110,6 +111,37 @@ export function stopOneCLIApprovalHandler(): void {
   adapterRef = null;
 }
 
+/**
+ * Try to route the approval to the requesting agent group's own web
+ * messaging group, if there is one. Returns the web messaging group
+ * + the userId extracted from its platform_id (`web:<userId>`) so
+ * callers can persist the approval as belonging to that user.
+ *
+ * This is the self-approval path for Solela-style personal
+ * assistants: the human who owns the agent IS the human who should
+ * decide on its credentialed actions. Rather than DM-ing an
+ * unrelated admin (the legacy admin-approves-user model), we hold
+ * the card for the requesting user themselves and let their web
+ * chat surface it inline.
+ *
+ * Returns `null` when the agent has no web messaging group wired
+ * (e.g. WhatsApp-only assistants). Callers fall back to the
+ * existing `pickApprover` admin-DM flow in that case.
+ */
+function findWebSelfApprovalTarget(
+  agentGroupId: string | null,
+): { messagingGroup: MessagingGroup; userId: string } | null {
+  if (!agentGroupId) return null;
+  const mgs = getMessagingGroupsByAgentGroup(agentGroupId);
+  const webMg = mgs.find((m) => m.channel_type === 'web');
+  if (!webMg) return null;
+  // Web platform_id convention is `web:<userId>` — strip the prefix
+  // so the persisted approval row + the Solela polling endpoint can
+  // key off the bare userId.
+  const userId = webMg.platform_id.startsWith('web:') ? webMg.platform_id.slice(4) : webMg.platform_id;
+  return { messagingGroup: webMg, userId };
+}
+
 async function handleRequest(request: ApprovalRequest): Promise<Decision> {
   if (!adapterRef) return 'deny';
 
@@ -118,6 +150,22 @@ async function handleRequest(request: ApprovalRequest): Promise<Decision> {
   // the scope for approver selection: admin @ group → global admin → owner.
   const originGroup = request.agent.externalId ? getAgentGroup(request.agent.externalId) : undefined;
   const agentGroupId = originGroup?.id ?? null;
+
+  // ── Self-approval branch ────────────────────────────────────
+  // If the agent has a web messaging group, prefer routing the
+  // card to the requesting user via web (Solela polls
+  // /admin/onecli-approvals/pending and renders the card inline).
+  // No chat-message delivery here — we just persist the
+  // pending_approvals row and the Solela UI surfaces it.
+  const selfTarget = findWebSelfApprovalTarget(agentGroupId);
+  if (selfTarget) {
+    return await routeSelfApproval(request, agentGroupId, selfTarget);
+  }
+
+  // ── Legacy admin-DM branch (fallback) ───────────────────────
+  // Used when the agent has no web messaging group (e.g.
+  // WhatsApp/Telegram-only assistants). Picks an admin via
+  // pickApprover and DMs them a chat-sdk approval card.
   const approvers = pickApprover(agentGroupId);
   if (approvers.length === 0) {
     log.warn('OneCLI approval auto-denied: no eligible approver', {
@@ -199,6 +247,82 @@ async function handleRequest(request: ApprovalRequest): Promise<Decision> {
   // in time to be recorded, even though the HTTP side will already be closing.
   const expiresAtMs = new Date(request.expiresAt).getTime();
   const timeoutMs = Math.max(1000, expiresAtMs - Date.now() - 1000);
+
+  return new Promise<Decision>((resolve) => {
+    const timer = setTimeout(() => {
+      if (!pending.has(approvalId)) return;
+      pending.delete(approvalId);
+      expireApproval(approvalId, 'no response').catch((err) =>
+        log.error('Failed to mark OneCLI approval expired', { approvalId, err }),
+      );
+      resolve('deny');
+    }, timeoutMs);
+
+    pending.set(approvalId, { resolve, timer });
+  });
+}
+
+/**
+ * Web self-approval flow. Persists the pending_approvals row with
+ * channel_type=web + platform_id=`web:<userId>` so the Solela web
+ * chat polling endpoint picks it up. No chat-message delivery — the
+ * UI surfaces the card from the polling response. Returns the same
+ * Promise<Decision> shape as the legacy path so the OneCLI SDK
+ * callback contract is unchanged; the Promise resolves when the
+ * user clicks via /admin/onecli-approvals/decide (which calls
+ * `resolveOneCLIApproval`), or when the timer expires.
+ */
+async function routeSelfApproval(
+  request: ApprovalRequest,
+  agentGroupId: string | null,
+  target: { messagingGroup: MessagingGroup; userId: string },
+): Promise<Decision> {
+  const approvalId = shortApprovalId();
+  const onecliTitle = 'Credentials Request';
+  const onecliOptions = [
+    { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
+    { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
+  ];
+
+  createPendingApproval({
+    approval_id: approvalId,
+    session_id: null,
+    request_id: request.id,
+    action: ONECLI_ACTION,
+    payload: JSON.stringify({
+      oneCliRequestId: request.id,
+      method: request.method,
+      host: request.host,
+      path: request.path,
+      bodyPreview: request.bodyPreview,
+      agent: request.agent,
+      // Approver = the user themselves (self-approval mode).
+      approver: target.userId,
+      selfApproval: true,
+    }),
+    created_at: new Date().toISOString(),
+    agent_group_id: agentGroupId,
+    channel_type: target.messagingGroup.channel_type,
+    platform_id: target.messagingGroup.platform_id,
+    // No platform_message_id — there's no chat-sdk card to edit on
+    // expiry. The Solela UI re-renders from the polling endpoint
+    // which now returns the row with `status='expired'`.
+    platform_message_id: null,
+    expires_at: request.expiresAt,
+    status: 'pending',
+    title: onecliTitle,
+    options_json: JSON.stringify(onecliOptions),
+  });
+
+  const expiresAtMs = new Date(request.expiresAt).getTime();
+  const timeoutMs = Math.max(1000, expiresAtMs - Date.now() - 1000);
+
+  log.info('OneCLI approval routed to web self-approval', {
+    approvalId,
+    userId: target.userId,
+    agentGroupId,
+    host: request.host,
+  });
 
   return new Promise<Decision>((resolve) => {
     const timer = setTimeout(() => {

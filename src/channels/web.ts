@@ -84,6 +84,8 @@ import {
 } from '../modules/permissions/db/pending-channel-approvals.js';
 import { deletePendingSenderApproval } from '../modules/permissions/db/pending-sender-approvals.js';
 import { upsertUser } from '../modules/permissions/db/users.js';
+import { getPendingApproval, getPendingApprovalsForWebUser } from '../db/sessions.js';
+import { resolveOneCLIApproval } from '../modules/approvals/onecli-approvals.js';
 import { routeInbound } from '../router.js';
 import { resolveSession } from '../session-manager.js';
 import { wakeContainer } from '../container-runner.js';
@@ -639,6 +641,26 @@ function createAdapter(): ChannelAdapter | null {
 
         if (req.method === 'POST' && url === '/admin/pending-approvals/decide') {
           void handleDecidePendingApproval(req, res);
+          return;
+        }
+
+        // OneCLI self-approval queue surfaced inline in the Solela web
+        // chat. Distinct from /admin/pending-approvals/* (which is the
+        // channel-registration approval queue) — those decide whether
+        // an unknown sender gets routed to an agent, these decide
+        // whether the agent's outbound credentialed action proceeds.
+        // See src/modules/approvals/onecli-approvals.ts for the
+        // routing logic (web messaging-group → self-approval branch).
+        if (
+          req.method === 'GET' &&
+          (url === '/admin/onecli-approvals/pending' || url.startsWith('/admin/onecli-approvals/pending?'))
+        ) {
+          handleListOneCliApprovals(res, url);
+          return;
+        }
+
+        if (req.method === 'POST' && url === '/admin/onecli-approvals/decide') {
+          void handleDecideOneCliApproval(req, res);
           return;
         }
 
@@ -2321,6 +2343,131 @@ function createAdapter(): ChannelAdapter | null {
       mgaId,
     });
     writeJson(res, 200, { ok: true, action: 'connect', agentGroupId: targetAgentGroupId, mgaId });
+  }
+
+  /**
+   * GET /admin/onecli-approvals/pending?userId=<id>
+   *
+   * Returns the pending OneCLI credential-approval queue for one
+   * user's web channel. Solela calls this on chat-page load and after
+   * each turn to render approval cards inline in the conversation
+   * thread.
+   *
+   * Each row carries everything the UI needs to render the card +
+   * decide: title, options, the parsed payload (HTTP verb / host /
+   * path / body preview), agent context, expiry. Status filter is
+   * baked into the DB query (`pending` only) so resolved/expired
+   * rows never reappear.
+   *
+   * Returns `{ approvals: [] }` when the user has none — same shape
+   * as the populated case so the client doesn't need a special path.
+   */
+  function handleListOneCliApprovals(res: http.ServerResponse, url: string): void {
+    const parsed = new URL(url, 'http://placeholder');
+    const userId = parsed.searchParams.get('userId');
+    if (!userId) {
+      writeJson(res, 400, { error: 'userId query param required' });
+      return;
+    }
+    const rows = getPendingApprovalsForWebUser(userId);
+    const approvals = rows.map((row) => {
+      let payload: Record<string, unknown> = {};
+      try {
+        payload = JSON.parse(row.payload) as Record<string, unknown>;
+      } catch {
+        // payload is opaque to the UI on parse error — render with
+        // an empty object rather than crash the whole list.
+      }
+      let options: unknown[] = [];
+      try {
+        options = JSON.parse(row.options_json);
+      } catch {
+        // ignore — UI will fall back to Approve/Reject defaults
+      }
+      return {
+        approvalId: row.approval_id,
+        title: row.title,
+        options,
+        payload,
+        createdAt: row.created_at,
+        expiresAt: row.expires_at,
+        agentGroupId: row.agent_group_id,
+      };
+    });
+    writeJson(res, 200, { approvals });
+  }
+
+  /**
+   * POST /admin/onecli-approvals/decide
+   *
+   * Body: `{ approvalId: string, decision: 'approve' | 'reject', userId?: string }`
+   *
+   * Resolves the pending OneCLI approval — releases the Promise the
+   * SDK callback is awaiting, which in turn unblocks the held HTTPS
+   * request on the gateway. The verdict propagates upstream within
+   * milliseconds and the agent's API call either proceeds (approve)
+   * or gets a 403 (reject).
+   *
+   * `userId` is optional but recommended: when present we verify the
+   * approval's `platform_id` actually starts with `web:<userId>`,
+   * preventing one Solela user from accidentally (or deliberately)
+   * resolving another user's pending approval if their session
+   * somehow has a stale approvalId.
+   */
+  async function handleDecideOneCliApproval(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    let body: { approvalId?: unknown; decision?: unknown; userId?: unknown };
+    try {
+      body = (await readJsonBody(req)) as typeof body;
+    } catch (err) {
+      writeJson(res, 400, { error: 'invalid json', detail: (err as Error).message });
+      return;
+    }
+    if (typeof body.approvalId !== 'string' || !body.approvalId) {
+      writeJson(res, 400, { error: 'approvalId required' });
+      return;
+    }
+    if (body.decision !== 'approve' && body.decision !== 'reject') {
+      writeJson(res, 400, { error: "decision must be 'approve' or 'reject'" });
+      return;
+    }
+
+    const row = getPendingApproval(body.approvalId);
+    if (!row) {
+      writeJson(res, 404, { error: 'approval not found or already decided' });
+      return;
+    }
+
+    // Owner check — if userId was passed, the approval must belong
+    // to that user's web channel. Skip when not passed (callers like
+    // ops scripts may decide on behalf without a session).
+    if (typeof body.userId === 'string' && body.userId) {
+      const expected = `web:${body.userId}`;
+      if (row.channel_type !== 'web' || row.platform_id !== expected) {
+        writeJson(res, 403, {
+          error: 'approval does not belong to this user',
+        });
+        return;
+      }
+    }
+
+    const resolved = resolveOneCLIApproval(body.approvalId, body.decision);
+    if (!resolved) {
+      // Promise was already resolved (timer fired) or the in-memory
+      // entry was lost across a restart. The DB row will still get
+      // status-flipped below for the UI, but the upstream gateway
+      // will have already closed the request.
+      writeJson(res, 409, {
+        error: 'approval already resolved or expired; verdict not delivered upstream',
+      });
+      return;
+    }
+
+    log.info('OneCLI self-approval decided', {
+      approvalId: body.approvalId,
+      decision: body.decision,
+      userId: typeof body.userId === 'string' ? body.userId : undefined,
+    });
+    writeJson(res, 200, { ok: true, approvalId: body.approvalId, decision: body.decision });
   }
 
   /**
