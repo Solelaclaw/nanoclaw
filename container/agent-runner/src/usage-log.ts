@@ -29,6 +29,8 @@
  */
 import fs from 'fs';
 
+import { recordGenAiUsageMetrics } from './observability/otel.js';
+
 const USAGE_LOG_PATH = '/workspace/usage.jsonl';
 
 /** One row in usage.jsonl — kept small so it's cheap to read in bulk. */
@@ -146,6 +148,18 @@ export function recordUsageFromSdkResult(message: unknown): void {
     // Mount missing, disk full, permission issue — log and continue.
     // We never want this to bubble up and break the agent loop.
     console.error(`[usage-log] append failed: ${(err as Error).message}`);
+  }
+
+  // Also emit OpenTelemetry metrics for deep-query backends
+  // (Honeycomb / Axiom / Grafana / etc.). The jsonl write above is
+  // the cheap aggregate the admin dashboard reads; OTel is the
+  // dimension-rich layer ("tokens by channel × model × user").
+  // No-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset — costs nothing
+  // when no backend is configured.
+  try {
+    recordGenAiUsageMetrics({ byModel: record.byModel, subtype: record.subtype });
+  } catch (err) {
+    console.error(`[usage-log] otel emit failed: ${(err as Error).message}`);
   }
 }
 
