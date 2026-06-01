@@ -35,13 +35,18 @@
  *   - Grafana Cloud      (free tier, alloy collector)
  *   - SigNoz Cloud       (open-source first, free tier)
  */
-import { metrics } from '@opentelemetry/api';
+import { metrics, trace, type Span, type Tracer } from '@opentelemetry/api';
 import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-http';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { Resource } from '@opentelemetry/resources';
 import {
   MeterProvider,
   PeriodicExportingMetricReader,
 } from '@opentelemetry/sdk-metrics';
+import {
+  BatchSpanProcessor,
+  NodeTracerProvider,
+} from '@opentelemetry/sdk-trace-node';
 import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions';
 
 import type { ModelBreakdown } from '../usage-log.js';
@@ -49,6 +54,7 @@ import type { ModelBreakdown } from '../usage-log.js';
 let initialized = false;
 let inputTokenCounter: ReturnType<ReturnType<typeof metrics.getMeter>['createCounter']> | null = null;
 let costCounter: ReturnType<ReturnType<typeof metrics.getMeter>['createCounter']> | null = null;
+let nanoclawTracer: Tracer | null = null;
 
 /**
  * Initialize the OTel pipeline. Called from agent-runner's entry
@@ -115,10 +121,77 @@ export function initOtel(): void {
         'aren\'t billed it — auth mode is upstream of this metric.',
       unit: 'USD',
     });
+
+    // ── Tracing ────────────────────────────────────────────────
+    // Same Axiom endpoint, different path (`/v1/traces`). Shares
+    // the Resource so spans inherit nanoclaw.agent_group_id,
+    // nanoclaw.session_id, channel.type for filtering in the
+    // admin traces UI.
+    //
+    // BatchSpanProcessor batches every ~5s — fine for the
+    // 1-message-per-minute cadence of a chat agent. If we ever
+    // start a high-frequency tool that opens many short spans,
+    // tune scheduledDelayMillis.
+    const traceExporter = new OTLPTraceExporter({
+      url: endpoint.endsWith('/v1/traces') ? endpoint : `${endpoint.replace(/\/$/, '')}/v1/traces`,
+      headers: parseHeaders(process.env.OTEL_EXPORTER_OTLP_HEADERS),
+    });
+
+    const tracerProvider = new NodeTracerProvider({
+      resource: new Resource({
+        [SemanticResourceAttributes.SERVICE_NAME]: 'nanoclaw-agent-runner',
+        [SemanticResourceAttributes.SERVICE_VERSION]:
+          process.env.NANOCLAW_AGENT_RUNNER_VERSION ?? 'unknown',
+        'nanoclaw.agent_group_id': process.env.NANOCLAW_AGENT_GROUP_ID ?? 'unknown',
+        'nanoclaw.session_id': process.env.NANOCLAW_SESSION_ID ?? 'unknown',
+        'channel.type': process.env.NANOCLAW_CHANNEL_TYPE ?? 'unknown',
+      }),
+    });
+
+    tracerProvider.addSpanProcessor(new BatchSpanProcessor(traceExporter));
+    tracerProvider.register();
+    nanoclawTracer = trace.getTracer('nanoclaw-agent-runner');
   } catch (err) {
     console.error('[otel] init failed; metrics will not ship', err);
     initialized = true; // don't retry on every call
   }
+}
+
+/**
+ * Wrap an async block in an OTel span. No-op (just runs the fn) when
+ * OTel isn't initialized (no AXIOM endpoint configured) — safe to
+ * call from any hot path. The span gets the attributes you pass in
+ * plus inherits the resource-level nanoclaw.session_id etc.
+ *
+ * Usage:
+ *   await traceSpan('gen_ai.session.turn', { 'gen_ai.system': 'anthropic' },
+ *     async () => { ...turn work... }
+ *   );
+ */
+export async function traceSpan<T>(
+  name: string,
+  attributes: Record<string, string | number | boolean>,
+  fn: (span: Span | null) => Promise<T>,
+): Promise<T> {
+  if (!nanoclawTracer) {
+    return fn(null);
+  }
+  return nanoclawTracer.startActiveSpan(name, async (span) => {
+    try {
+      for (const [k, v] of Object.entries(attributes)) {
+        span.setAttribute(k, v);
+      }
+      const result = await fn(span);
+      span.setStatus({ code: 1 }); // OK
+      return result;
+    } catch (err) {
+      span.recordException(err as Error);
+      span.setStatus({ code: 2, message: (err as Error).message }); // ERROR
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
 }
 
 /**
