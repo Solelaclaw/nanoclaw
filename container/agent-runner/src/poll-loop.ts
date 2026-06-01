@@ -14,6 +14,7 @@ import {
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
+import { traceSpan } from './observability/otel.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
@@ -208,7 +209,26 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName);
+      // Wrap the whole turn in an OTel span. Inherits resource attrs
+      // (agent_group_id, session_id, channel.type) from the trace
+      // provider; we add per-turn details here. The span shows up in
+      // Axiom as a single row per agent turn — the admin /admin/traces
+      // page queries this exact shape.
+      //
+      // No-op when OTel is uninitialised (no AXIOM endpoint set), so
+      // safe on every code path including local dev.
+      const result = await traceSpan(
+        'gen_ai.session.turn',
+        {
+          'gen_ai.system': 'anthropic',
+          'gen_ai.operation.name': 'agent_turn',
+          'nanoclaw.batch_size': processingIds.length,
+          'nanoclaw.in_reply_to': routing.inReplyTo ?? '',
+          'nanoclaw.continuation_present': Boolean(continuation),
+        },
+        async () =>
+          processQuery(query, routing, processingIds, config.providerName),
+      );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
