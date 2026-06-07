@@ -38,7 +38,7 @@ export const askUserQuestion: McpToolDefinition = {
   tool: {
     name: 'ask_user_question',
     description:
-      'Ask the user a multiple-choice question and wait for their response. This is a blocking call — execution pauses until the user responds or the timeout expires. Provide a short card title (e.g. "Confirm deletion") and an array of options — each option may be a plain string (used as both button label and result value) or an object { label, selectedLabel?, value? } where selectedLabel is the text shown on the card after the user clicks.',
+      'Ask the user a multiple-choice question and wait for their response. This is a blocking call — execution pauses until the user responds or the timeout expires.\n\nProvide a short card title (e.g. "Send email to Gavriel?") and an array of options — each option may be a plain string (used as both button label and result value) or an object { label, selectedLabel?, value? } where selectedLabel is the text shown on the card after the user clicks.\n\nWHEN THE QUESTION GATES AN ACTION (sending an email, posting a message, creating a meeting, …), ALWAYS include the action content so the user can see WHAT they\'re confirming before they click. Use whichever of these fits best:\n  • `body` — the drafted text the agent generated (the email body, the message draft, the meeting agenda). Plain text, no markdown wrappers.\n  • `details` — labelled key/value pairs the user needs to see at a glance (e.g. { "To": "gavriel@…", "Subject": "Re: roadmap", "When": "Fri 14:30" }). Use this for structured fields like recipients, dates, amounts.\n  • `subtitle` — short one-liner shown under the title (e.g. "to gavriel@nanoco.ai"). Use ONLY for a single piece of trivial context that doesn\'t belong in details.\n  • `payload` — for credentialed HTTP calls only. OneCLI-style { method, host, path, bodyPreview } — the web side vendor-parses Gmail / Calendar / Slack / WhatsApp / Stripe etc. automatically.\n\nA card that asks "Send this email? [Yes] [No]" with no body/details is a black-box ask — the user will reject or stall because they can\'t see what they\'re approving. Always show your work.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -61,6 +61,37 @@ export const askUserQuestion: McpToolDefinition = {
             ],
           },
           description: 'Options for the user to choose from (string or {label, selectedLabel?, value?})',
+        },
+        subtitle: {
+          type: 'string',
+          description:
+            'Optional one-line subtitle shown under the title (e.g. "to gavriel@nanoco.ai"). Single piece of trivial context only — anything richer goes in details/body/payload.',
+        },
+        body: {
+          type: 'string',
+          description:
+            'Optional free-form text body (e.g. the email body, message draft, meeting agenda). Rendered as a scrollable preview block above the buttons.',
+        },
+        details: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description:
+            'Optional `{ label: value }` map of fields to show as labelled rows above the buttons (e.g. `{ "To": "gavriel@…", "Subject": "Re: roadmap" }`). Each pair renders on one line so prefer short values.',
+        },
+        payload: {
+          type: 'object',
+          properties: {
+            method: { type: 'string' },
+            host: { type: 'string' },
+            path: { type: 'string' },
+            bodyPreview: { type: 'string' },
+            agent: {
+              type: 'object',
+              properties: { name: { type: 'string' } },
+            },
+          },
+          description:
+            'Optional OneCLI-style HTTP request payload — when present, the web side runs its vendor parser to render Gmail/Calendar/Slack/etc. fields automatically. Use this when the question gates a credentialed HTTP call whose body is rich enough to benefit from vendor-aware extraction.',
         },
         timeout: { type: 'number', description: 'Timeout in seconds (default: 300)' },
       },
@@ -89,6 +120,21 @@ export const askUserQuestion: McpToolDefinition = {
     const questionId = generateId();
     const r = routing();
 
+    // Collect optional context fields — only emit ones that were
+    // actually set so nanoclaw can decide between "no context" and
+    // "agent shipped an empty string". Forward-compatible: existing
+    // ask_user_question call sites that don't pass these still work.
+    const subtitle = typeof args.subtitle === 'string' && args.subtitle ? args.subtitle : undefined;
+    const body = typeof args.body === 'string' && args.body ? args.body : undefined;
+    const details =
+      args.details && typeof args.details === 'object' && !Array.isArray(args.details)
+        ? (args.details as Record<string, string>)
+        : undefined;
+    const payload =
+      args.payload && typeof args.payload === 'object' && !Array.isArray(args.payload)
+        ? (args.payload as Record<string, unknown>)
+        : undefined;
+
     // Write question card to outbound.db
     writeMessageOut({
       id: questionId,
@@ -102,6 +148,14 @@ export const askUserQuestion: McpToolDefinition = {
         title,
         question,
         options,
+        // Spread context fields at the top level — delivery.ts on
+        // the nanoclaw side reads them by name to populate the
+        // pending_questions.context_json column. Undefined values
+        // get dropped by JSON.stringify so the wire stays clean.
+        subtitle,
+        body,
+        details,
+        payload,
       }),
     });
 

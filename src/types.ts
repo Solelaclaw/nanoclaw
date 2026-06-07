@@ -181,7 +181,44 @@ export interface PendingQuestion {
   thread_id: string | null;
   title: string;
   options: import('./channels/ask-question.js').NormalizedOption[];
+  /** Optional structured context the agent ships with the question
+   *  (email body / meeting details / message draft) — surfaced to
+   *  the web QuestionCard so the user sees WHAT they're confirming
+   *  before clicking. Null for legacy / minimal `ask_user_question`
+   *  calls; populated when the container sends any of body /
+   *  subtitle / details / payload alongside the title + options. */
+  context?: PendingQuestionContext | null;
   created_at: string;
+}
+
+/** Free-form context the agent attaches to a question card. All
+ *  fields optional; the renderer picks whichever is present. The
+ *  shape is intentionally identical to the web QuestionCard props
+ *  so the on-the-wire JSON can be forwarded verbatim by the
+ *  `/admin/agent-questions/pending` endpoint without translation. */
+export interface PendingQuestionContext {
+  /** Short one-liner shown under the title. */
+  subtitle?: string;
+  /** Free-form text body (e.g. the email content the user is about
+   *  to send). Rendered as a scrollable block. */
+  body?: string;
+  /** Labelled key/value pairs (e.g. `{ Subject: "...", To: "..." }`).
+   *  Rendered as a compact form. */
+  details?: Record<string, string>;
+  /** OneCLI-style request payload — when present, the web side runs
+   *  its summarizeApproval() parser to extract To/Subject/Body
+   *  automatically (works for Gmail, Calendar, Slack, WhatsApp,
+   *  Stripe, etc. — see approval-summary.ts on the web side). Use
+   *  this over `body`/`details` when the question gates an HTTP
+   *  call whose request body is rich enough to want vendor-aware
+   *  parsing. */
+  payload?: {
+    method?: string;
+    host?: string;
+    path?: string;
+    bodyPreview?: string;
+    agent?: { name?: string };
+  };
 }
 
 // ── Pending approvals (central DB) ──

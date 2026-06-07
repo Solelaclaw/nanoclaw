@@ -26,7 +26,7 @@ import { rewriteConnectUrls } from './connect-url-rewrite.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
-import type { Session } from './types.js';
+import type { PendingQuestion, Session } from './types.js';
 
 const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
@@ -323,6 +323,19 @@ async function deliverMessage(
         questionId: content.questionId,
       });
     } else {
+      // Pull any optional context the container shipped alongside
+      // the question — subtitle / body / details / payload. These
+      // let the web QuestionCard render the email body / meeting
+      // details / message draft above the option buttons so the
+      // user can see WHAT they're confirming. Forward-compatible:
+      // when the container doesn't set them the column lands as
+      // NULL and the UI falls back to title + buttons only.
+      const ctx: Record<string, unknown> = {};
+      if (typeof content.subtitle === 'string' && content.subtitle) ctx.subtitle = content.subtitle;
+      if (typeof content.body === 'string' && content.body) ctx.body = content.body;
+      if (content.details && typeof content.details === 'object') ctx.details = content.details;
+      if (content.payload && typeof content.payload === 'object') ctx.payload = content.payload;
+      const context = Object.keys(ctx).length > 0 ? (ctx as PendingQuestion['context']) : null;
       const inserted = createPendingQuestion({
         question_id: content.questionId,
         session_id: session.id,
@@ -332,10 +345,15 @@ async function deliverMessage(
         thread_id: msg.thread_id,
         title,
         options: normalizeOptions(rawOptions as never),
+        context,
         created_at: new Date().toISOString(),
       });
       if (inserted) {
-        log.info('Pending question created', { questionId: content.questionId, sessionId: session.id });
+        log.info('Pending question created', {
+          questionId: content.questionId,
+          sessionId: session.id,
+          hasContext: !!context,
+        });
       }
     }
   }

@@ -2517,14 +2517,20 @@ function createAdapter(): ChannelAdapter | null {
     const questions = rows.map((row) => ({
       questionId: row.question_id,
       title: row.title,
-      // The container's ask_user_question tool stores the question
-      // text inside the outbound message content, not in pending_questions
-      // (which holds the render metadata for the response handler).
-      // For the UI we expose title + options; if a richer question
-      // body is ever needed we can fan out from message_out_id.
       options: row.options,
       createdAt: row.created_at,
       sessionId: row.session_id,
+      // Optional structured context the agent attached to the
+      // question — surfaces email body / meeting details / message
+      // draft to the web QuestionCard so the user can SEE what
+      // they're confirming. Spread inline so each field appears as
+      // a top-level key on the wire (subtitle / body / details /
+      // payload) — matches the shape the web side already accepts
+      // in `PendingAgentQuestion` (apps/web/src/lib/nanoclaw-
+      // bridge.ts). Null/missing → no extra fields emitted, so
+      // the response stays back-compat with any consumer that
+      // hasn't been updated.
+      ...(row.context ?? {}),
     }));
     writeJson(res, 200, { questions });
   }

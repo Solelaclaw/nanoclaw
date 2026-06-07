@@ -125,6 +125,14 @@ CREATE TABLE pending_questions (
   thread_id      TEXT,
   title          TEXT NOT NULL,
   options_json   TEXT NOT NULL,
+  -- Optional structured context the agent ships with the question:
+  -- the email body / meeting details / message draft the card is
+  -- gating. JSON shape mirrors the web QuestionCard props with the
+  -- optional fields subtitle, body, details, payload. Nullable so
+  -- existing call sites that only pass title + options still work
+  -- unchanged. See migration 018-question-context for the ALTER on
+  -- live DBs.
+  context_json   TEXT,
   created_at     TEXT NOT NULL
 );
 

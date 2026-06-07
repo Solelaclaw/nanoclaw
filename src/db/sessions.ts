@@ -106,8 +106,8 @@ export function deleteSession(id: string): void {
 export function createPendingQuestion(pq: PendingQuestion): boolean {
   const result = getDb()
     .prepare(
-      `INSERT OR IGNORE INTO pending_questions (question_id, session_id, message_out_id, platform_id, channel_type, thread_id, title, options_json, created_at)
-       VALUES (@question_id, @session_id, @message_out_id, @platform_id, @channel_type, @thread_id, @title, @options_json, @created_at)`,
+      `INSERT OR IGNORE INTO pending_questions (question_id, session_id, message_out_id, platform_id, channel_type, thread_id, title, options_json, context_json, created_at)
+       VALUES (@question_id, @session_id, @message_out_id, @platform_id, @channel_type, @thread_id, @title, @options_json, @context_json, @created_at)`,
     )
     .run({
       question_id: pq.question_id,
@@ -118,6 +118,10 @@ export function createPendingQuestion(pq: PendingQuestion): boolean {
       thread_id: pq.thread_id,
       title: pq.title,
       options_json: JSON.stringify(pq.options),
+      // Persist context as JSON or NULL — the column is nullable
+      // and back-compat insertions (no context attached) get a NULL
+      // row that `getPendingQuestion*` decode back to `null`.
+      context_json: pq.context ? JSON.stringify(pq.context) : null,
       created_at: pq.created_at,
     });
   return result.changes > 0;
@@ -125,11 +129,18 @@ export function createPendingQuestion(pq: PendingQuestion): boolean {
 
 export function getPendingQuestion(questionId: string): PendingQuestion | undefined {
   const row = getDb().prepare('SELECT * FROM pending_questions WHERE question_id = ?').get(questionId) as
-    | (Omit<PendingQuestion, 'options'> & { options_json: string })
+    | (Omit<PendingQuestion, 'options' | 'context'> & {
+        options_json: string;
+        context_json: string | null;
+      })
     | undefined;
   if (!row) return undefined;
-  const { options_json, ...rest } = row;
-  return { ...rest, options: JSON.parse(options_json) };
+  const { options_json, context_json, ...rest } = row;
+  return {
+    ...rest,
+    options: JSON.parse(options_json),
+    context: context_json ? JSON.parse(context_json) : null,
+  };
 }
 
 export function deletePendingQuestion(questionId: string): void {
@@ -152,10 +163,19 @@ export function getPendingQuestionsForWebUser(userId: string): PendingQuestion[]
          AND platform_id = ?
        ORDER BY created_at ASC`,
     )
-    .all(`web:${userId}`) as Array<Omit<PendingQuestion, 'options'> & { options_json: string }>;
+    .all(`web:${userId}`) as Array<
+    Omit<PendingQuestion, 'options' | 'context'> & {
+      options_json: string;
+      context_json: string | null;
+    }
+  >;
   return rows.map((row) => {
-    const { options_json, ...rest } = row;
-    return { ...rest, options: JSON.parse(options_json) };
+    const { options_json, context_json, ...rest } = row;
+    return {
+      ...rest,
+      options: JSON.parse(options_json),
+      context: context_json ? JSON.parse(context_json) : null,
+    };
   });
 }
 
