@@ -627,6 +627,11 @@ function createAdapter(): ChannelAdapter | null {
           return;
         }
 
+        if (req.method === 'POST' && url === '/admin/channels/slack/claim-link') {
+          void handleSlackClaimLink(req, res);
+          return;
+        }
+
         if (req.method === 'POST' && url === '/admin/channels/whatsapp/pair-start') {
           void handleWhatsAppPairStart(req, res);
           return;
@@ -2144,6 +2149,223 @@ function createAdapter(): ChannelAdapter | null {
       });
     } catch (err) {
       log.error('Telegram claim-link failed', { err, token });
+      writeJson(res, 500, { error: 'claim failed', detail: (err as Error).message });
+    }
+  }
+
+  /**
+   * Token-based Slack link claim — sibling of `handleTelegramClaimLink`
+   * and `handleWhatsAppClaimLink`. The web app polls this endpoint
+   * every ~3 s while the user is on /channels/slack, having just been
+   * shown the `link <token>` code to DM the bot.
+   *
+   * Flow:
+   *   - User receives `link <CODE>` on the web page (auto-copied to
+   *     clipboard).
+   *   - User clicks "Open Slack" → Slack lands on the DM with NanoCo.
+   *   - User pastes + Enter.
+   *   - The DM hits the slack adapter → channelRequestGate creates a
+   *     pending_channel_approval (or pending_sender_approval) row with
+   *     the message text intact.
+   *   - The web poll fires this endpoint, we scan the approval rows
+   *     for `link <token>`, and on match wire the slack identity to
+   *     the user's agent group.
+   *
+   * Slack identity format: `slack:<user_id>` (e.g. `slack:U0B7G6T15N0`).
+   * The response surfaces `slackUserId` so the web confirmation can
+   * show "Slack user U0B7G6T15N0 is now wired" without re-querying.
+   *
+   * Body: `{ userId: string, token: string }`
+   * Returns: `{ found: true, identifier, slackUserId }` or `{ found: false }`
+   */
+  async function handleSlackClaimLink(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    let body: { userId?: unknown; token?: unknown };
+    try {
+      body = (await readJsonBody(req)) as typeof body;
+    } catch (err) {
+      writeJson(res, 400, { error: 'invalid json', detail: (err as Error).message });
+      return;
+    }
+    if (typeof body.userId !== 'string' || !body.userId) {
+      writeJson(res, 400, { error: 'userId required' });
+      return;
+    }
+    if (typeof body.token !== 'string' || !body.token) {
+      writeJson(res, 400, { error: 'token required' });
+      return;
+    }
+    const token = body.token.trim();
+    if (token.length < 4 || token.length > 32) {
+      writeJson(res, 400, { error: 'token must be 4–32 chars' });
+      return;
+    }
+    const folder = `web-${body.userId}`.replace(/[^a-zA-Z0-9_-]/g, '-');
+    const agentGroup = getAgentGroupByFolder(folder);
+    if (!agentGroup) {
+      writeJson(res, 404, { error: 'agent group not found for web user' });
+      return;
+    }
+
+    // Slack only supports the `link <token>` shape — there's no
+    // `/start <token>` deep-link variant the way Telegram has, since
+    // Slack doesn't ship a deep-link-with-arg pattern that pre-fills
+    // a message. Web side auto-copies the code into the clipboard
+    // and ships the user to the DM via app.slack.com/client/<TEAM>/<BOT>;
+    // they paste + Enter, the DM lands here, we claim.
+    const escToken = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const tokenRe = new RegExp(`\\blink\\s+${escToken}\\b`, 'i');
+
+    type Row = {
+      approval_id: string;
+      messaging_group_id: string;
+      sender_identity: string | null;
+      sender_name: string | null;
+      original_message: string;
+      kind: 'channel' | 'sender';
+    };
+    const rows: Row[] = [
+      ...(getDb()
+        .prepare(
+          `SELECT pca.messaging_group_id AS approval_id, pca.messaging_group_id,
+                  NULL AS sender_identity, NULL AS sender_name,
+                  pca.original_message, 'channel' AS kind
+             FROM pending_channel_approvals pca
+             JOIN messaging_groups mg ON mg.id = pca.messaging_group_id
+            WHERE mg.channel_type = 'slack'`,
+        )
+        .all() as Row[]),
+      ...(getDb()
+        .prepare(
+          `SELECT psa.id AS approval_id, psa.messaging_group_id, psa.sender_identity,
+                  psa.sender_name, psa.original_message, 'sender' AS kind
+             FROM pending_sender_approvals psa
+             JOIN messaging_groups mg ON mg.id = psa.messaging_group_id
+            WHERE mg.channel_type = 'slack'`,
+        )
+        .all() as Row[]),
+    ];
+
+    let match: Row | undefined;
+    let matchSenderIdentity: string | null = null;
+    let matchSenderName: string | null = null;
+    for (const row of rows) {
+      try {
+        const event = JSON.parse(row.original_message) as {
+          message?: { content?: unknown; senderId?: string; sender?: string };
+        };
+        const inner = event.message?.content;
+        let text = '';
+        let senderIdFromContent: string | undefined;
+        let senderNameFromContent: string | undefined;
+        if (typeof inner === 'string') {
+          try {
+            const parsed = JSON.parse(inner) as {
+              text?: string;
+              senderId?: string;
+              sender?: string;
+            };
+            text = typeof parsed.text === 'string' ? parsed.text : inner;
+            senderIdFromContent = parsed.senderId;
+            senderNameFromContent = parsed.sender;
+          } catch {
+            text = inner;
+          }
+        } else if (inner && typeof inner === 'object') {
+          const obj = inner as Record<string, unknown>;
+          text = (typeof obj.text === 'string' && obj.text) || (typeof obj.body === 'string' && obj.body) || '';
+          senderIdFromContent = typeof obj.senderId === 'string' ? obj.senderId : undefined;
+          senderNameFromContent = typeof obj.sender === 'string' ? obj.sender : undefined;
+        }
+        if (tokenRe.test(text)) {
+          match = row;
+          matchSenderIdentity = row.sender_identity ?? senderIdFromContent ?? event.message?.senderId ?? null;
+          matchSenderName = row.sender_name ?? senderNameFromContent ?? event.message?.sender ?? null;
+          break;
+        }
+      } catch {
+        // skip malformed rows
+      }
+    }
+
+    if (!match || !matchSenderIdentity) {
+      writeJson(res, 200, { found: false });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    // `slack:<user_id>` — strip the prefix; the U... id is the user's
+    // canonical Slack identity.
+    const slackUserId = matchSenderIdentity.startsWith('slack:')
+      ? matchSenderIdentity.slice('slack:'.length)
+      : matchSenderIdentity;
+    const displayName = matchSenderName || `slack:${slackUserId}`;
+
+    try {
+      upsertUser({
+        id: matchSenderIdentity,
+        kind: 'slack',
+        display_name: displayName,
+        created_at: now,
+      });
+
+      addMember({
+        user_id: matchSenderIdentity,
+        agent_group_id: agentGroup.id,
+        added_by: null,
+        added_at: now,
+      });
+
+      // Name the messaging_group BEFORE wiring so the auto-created
+      // agent_destinations row gets a meaningful local_name (e.g.
+      // "slack-dan-posalski") instead of the fallback "slack-mg-…".
+      const slMg = getMessagingGroup(match.messaging_group_id);
+      if (slMg && !slMg.name) {
+        updateMessagingGroup(match.messaging_group_id, {
+          name: `slack ${displayName}`,
+        });
+      }
+
+      if (!getMessagingGroupAgentByPair(match.messaging_group_id, agentGroup.id)) {
+        createMessagingGroupAgent({
+          id: `mga-sl-link-${Date.now().toString(36)}`,
+          messaging_group_id: match.messaging_group_id,
+          agent_group_id: agentGroup.id,
+          engage_mode: 'pattern',
+          engage_pattern: '.',
+          sender_scope: 'all',
+          ignored_message_policy: 'drop',
+          // 'agent-shared' so Slack + Web share one continuous
+          // assistant memory for this user — mirrors the WhatsApp and
+          // Telegram variants.
+          session_mode: 'agent-shared',
+          priority: 0,
+          created_at: now,
+        });
+      }
+
+      updateMessagingGroup(match.messaging_group_id, { unknown_sender_policy: 'public' });
+
+      if (match.kind === 'channel') {
+        getDb()
+          .prepare('DELETE FROM pending_channel_approvals WHERE messaging_group_id = ?')
+          .run(match.messaging_group_id);
+      } else {
+        deletePendingSenderApproval(match.approval_id);
+      }
+
+      // Restart any running container for this agent group so the
+      // newly-added slack destination is picked up — same rationale
+      // as the WhatsApp / Telegram siblings (container reads
+      // agent_destinations once at spawn time, not on every message).
+      restartAgentGroupContainers(agentGroup.id, 'channel paired (slack)');
+
+      writeJson(res, 200, {
+        found: true,
+        identifier: matchSenderIdentity,
+        slackUserId,
+      });
+    } catch (err) {
+      log.error('Slack claim-link failed', { err, token });
       writeJson(res, 500, { error: 'claim failed', detail: (err as Error).message });
     }
   }
