@@ -106,6 +106,42 @@ export interface RequestChannelApprovalInput {
   event: InboundEvent;
 }
 
+/**
+ * Pattern of a self-link claim: `link <6-32 alphanum>` anywhere in
+ * the message. Same shape the web-side issues for WhatsApp / Telegram
+ * / Slack pairing. When the inbound text matches this, the sender
+ * has already proven they own a NanoCo account (the token was minted
+ * for them on the web side and copied to their clipboard by us); the
+ * unknown-sender approval gate is the wrong door for them, since we
+ * have no actual unknown sender — we have a known sender doing a
+ * self-claim. The handler downstream (handle*ClaimLink in web.ts)
+ * validates the token against the central DB and creates the wire.
+ *
+ * If the token DOESN'T match a real pending row, the row created
+ * here sits as an orphan pending_channel_approval — the host inbox
+ * can sweep it, no harm done.
+ */
+const LINK_CLAIM_PATTERN = /\blink\s+[A-Z0-9]{6,32}\b/i;
+
+function extractMessageText(event: InboundEvent): string {
+  const inner = event.message?.content as unknown;
+  if (typeof inner === 'string') {
+    try {
+      const parsed = JSON.parse(inner) as { text?: unknown; body?: unknown };
+      const t =
+        (typeof parsed.text === 'string' && parsed.text) || (typeof parsed.body === 'string' && parsed.body) || '';
+      return t || inner;
+    } catch {
+      return inner;
+    }
+  }
+  if (inner && typeof inner === 'object') {
+    const obj = inner as Record<string, unknown>;
+    return (typeof obj.text === 'string' && obj.text) || (typeof obj.body === 'string' && obj.body) || '';
+  }
+  return '';
+}
+
 export async function requestChannelApproval(input: RequestChannelApprovalInput): Promise<void> {
   const { messagingGroupId, event } = input;
 
@@ -125,8 +161,16 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   // are returned regardless of which group we pass.
   const referenceGroup = agentGroups[0];
 
-  const approvers = pickApprover(referenceGroup.id);
-  if (approvers.length === 0) {
+  // Self-claim short-circuit — see LINK_CLAIM_PATTERN above. When the
+  // user's first message IS a token presentation, we don't need an
+  // approver: the web side validates the token in the claim-link
+  // handler. Skip the picker, create the row directly with a null
+  // approver, and let the web poll handler take it from there.
+  const messageText = extractMessageText(event);
+  const isSelfClaim = LINK_CLAIM_PATTERN.test(messageText);
+
+  const approvers = isSelfClaim ? [] : pickApprover(referenceGroup.id);
+  if (!isSelfClaim && approvers.length === 0) {
     log.warn('Channel registration skipped — no owner or admin configured', {
       messagingGroupId,
       targetAgentGroupId: referenceGroup.id,
@@ -155,8 +199,14 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
 
   // V2 behavioural change ↓ — create the pending row even when no DM delivery
   // is reachable. The org-scoped web inbox claims it via the admin API.
-  const delivery = await pickApprovalDelivery(approvers, originChannelType);
-  const approverUserId = delivery?.userId ?? approvers[0];
+  //
+  // Self-claim path: skip approval delivery entirely (no approver to
+  // deliver to), stamp a sentinel approver id so the row schema is
+  // satisfied. The web claim-link handler that picks this up
+  // downstream doesn't check approver_user_id when matching tokens;
+  // it scans original_message text against the user-supplied token.
+  const delivery = isSelfClaim ? null : await pickApprovalDelivery(approvers, originChannelType);
+  const approverUserId = delivery?.userId ?? approvers[0] ?? (isSelfClaim ? '__self_claim__' : '');
 
   const isGroup = event.message?.isGroup ?? originMg?.is_group === 1;
 
@@ -184,6 +234,18 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     title,
     options_json: JSON.stringify(options),
   });
+
+  // Self-claim row created — the web claim-link handler will pick
+  // this up on its next poll (3s) and wire the channel. No DM card
+  // delivery needed (there's no approver to deliver to, and the
+  // sender is already authenticated via their pre-issued token).
+  if (isSelfClaim) {
+    log.info('Self-claim channel approval row created — awaiting web claim-link poll', {
+      messagingGroupId,
+      channelType: originChannelType,
+    });
+    return;
+  }
 
   // No DM reachable → row is created, inbox will surface it, return early.
   if (!delivery) {
