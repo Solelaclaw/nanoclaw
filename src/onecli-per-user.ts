@@ -39,6 +39,13 @@ export interface AgentOneCliConfig {
    * construction — when used as the SDK's `apiKey`, the gateway
    * automatically scopes secret-injection to the user's project. */
   token: string;
+  /** Optional IANA timezone (e.g. "Europe/Paris") for the human
+   *  this agent belongs to. The web app captures it from the
+   *  browser on /chat mount and stores it on the Assistant row.
+   *  Null when the user hasn't opened chat yet or browser-side
+   *  capture failed — container-runner falls back to the host
+   *  TIMEZONE in that case. */
+  timezone?: string | null;
 }
 
 const FETCH_TIMEOUT_MS = 10_000;
@@ -50,11 +57,7 @@ const cache = new Map<string, AgentOneCliConfig>();
 const inFlight = new Map<string, Promise<AgentOneCliConfig | null>>();
 
 function getEnv(): { baseUrl: string; bearer: string } | null {
-  const env = readEnvFile([
-    'SOLELACLAWDE_PUBLIC_URL',
-    'SOLELACLAWDE_WEB_BASE_URL',
-    'SOLELACLAWDE_WEB_CHANNEL_TOKEN',
-  ]);
+  const env = readEnvFile(['SOLELACLAWDE_PUBLIC_URL', 'SOLELACLAWDE_WEB_BASE_URL', 'SOLELACLAWDE_WEB_CHANNEL_TOKEN']);
   const baseUrl = (
     process.env.SOLELACLAWDE_PUBLIC_URL ??
     env.SOLELACLAWDE_PUBLIC_URL ??
@@ -80,9 +83,7 @@ function getEnv(): { baseUrl: string; bearer: string } | null {
  * Concurrent calls for the same agent_group_id share one in-flight
  * fetch (no thundering herd at startup).
  */
-export async function fetchAgentOneCliConfig(
-  agentGroupId: string,
-): Promise<AgentOneCliConfig | null> {
+export async function fetchAgentOneCliConfig(agentGroupId: string): Promise<AgentOneCliConfig | null> {
   const hit = cache.get(agentGroupId);
   if (hit) return hit;
 

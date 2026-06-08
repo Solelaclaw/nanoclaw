@@ -434,10 +434,7 @@ async function buildContainerArgs(
   if (process.env.SOLELACLAWDE_AGENT_API_TOKEN) {
     args.push('-e', `SOLELACLAWDE_AGENT_API_TOKEN=${process.env.SOLELACLAWDE_AGENT_API_TOKEN}`);
   }
-  args.push(
-    '-e',
-    `SOLELACLAWDE_API_URL=${process.env.SOLELACLAWDE_API_URL ?? 'https://app.solela.ai'}`,
-  );
+  args.push('-e', `SOLELACLAWDE_API_URL=${process.env.SOLELACLAWDE_API_URL ?? 'https://app.solela.ai'}`);
 
   // OpenTelemetry — let the agent-runner inside the container emit
   // per-channel / per-model token + cost metrics. Container-shape
@@ -453,22 +450,13 @@ async function buildContainerArgs(
     }
   }
   if (process.env.OTEL_EXPORTER_OTLP_ENDPOINT) {
-    args.push(
-      '-e',
-      `OTEL_EXPORTER_OTLP_ENDPOINT=${process.env.OTEL_EXPORTER_OTLP_ENDPOINT}`,
-    );
+    args.push('-e', `OTEL_EXPORTER_OTLP_ENDPOINT=${process.env.OTEL_EXPORTER_OTLP_ENDPOINT}`);
   }
   if (process.env.OTEL_EXPORTER_OTLP_HEADERS) {
-    args.push(
-      '-e',
-      `OTEL_EXPORTER_OTLP_HEADERS=${process.env.OTEL_EXPORTER_OTLP_HEADERS}`,
-    );
+    args.push('-e', `OTEL_EXPORTER_OTLP_HEADERS=${process.env.OTEL_EXPORTER_OTLP_HEADERS}`);
   }
   if (process.env.NANOCLAW_AGENT_RUNNER_VERSION) {
-    args.push(
-      '-e',
-      `NANOCLAW_AGENT_RUNNER_VERSION=${process.env.NANOCLAW_AGENT_RUNNER_VERSION}`,
-    );
+    args.push('-e', `NANOCLAW_AGENT_RUNNER_VERSION=${process.env.NANOCLAW_AGENT_RUNNER_VERSION}`);
   }
 
   // Apollo API key — used by the apollo_search_prospects /
@@ -532,6 +520,27 @@ async function buildContainerArgs(
       throw new Error(
         `Web-channel agent ${agentGroup.id}: failed to fetch per-user OneCLI config from web app — refusing to spawn (no fallback to legacy shared key, that would re-leak across tenants)`,
       );
+    }
+
+    // Per-user TZ override — the web app captures the user's IANA
+    // timezone on /chat mount and ships it here via the bridge. We
+    // patch the `TZ=…` arg we already pushed (line ~426) with the
+    // user's value so the agent's "tomorrow 3pm" lands on THEIR
+    // wall clock instead of the VM host's. Null/missing falls back
+    // to the host TIMEZONE constant (the original behaviour).
+    if (userCfg.timezone) {
+      // args was filled earlier as [..., '-e', `TZ=<HOST_TZ>`, ...].
+      // Find that exact entry and rewrite it. Searching by prefix
+      // 'TZ=' keeps the patch resilient to upstream re-ordering of
+      // the args list.
+      const tzIdx = args.findIndex((a) => typeof a === 'string' && a.startsWith('TZ='));
+      if (tzIdx !== -1) {
+        args[tzIdx] = `TZ=${userCfg.timezone}`;
+        log.info('Per-user TZ applied to container', {
+          agentGroupId: agentGroup.id,
+          timezone: userCfg.timezone,
+        });
+      }
     }
     // The SDK's `applyContainerConfig` only sends `Authorization: Bearer`
     // — no `X-Project-Id` header. So even with the org-scoped admin key
