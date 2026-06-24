@@ -7,9 +7,14 @@
  *
  *   POST /messages              — write one inbound chat from a user
  *     headers:  X-Solelaclawde-Token: <SOLELACLAWDE_WEB_CHANNEL_TOKEN>
- *     body:     { userId: string, text: string,
- *                 displayName?: string, threadId?: string|null }
+ *     body:     { userId: string, text?: string,
+ *                 displayName?: string, threadId?: string|null,
+ *                 attachments?: { name, mimeType, data (base64),
+ *                                 size?, type? }[] }
  *     returns:  { id: string }            (the platform_id that routed it)
+ *     note:     text OR ≥1 attachment is required. Attachments ride as base64;
+ *               the host's session-manager writes them into the session inbox
+ *               and hands the agent a /workspace path to Read.
  *
  *   GET  /stream/:userId        — long-lived SSE: agent replies for that user
  *     headers:  Authorization: Bearer <SOLELACLAWDE_WEB_CHANNEL_TOKEN>
@@ -102,6 +107,78 @@ import { getRegisteredChannelNames, registerChannelAdapter } from './channel-reg
 const CHANNEL_TYPE = 'web';
 const DEFAULT_PORT = 11000;
 const DEFAULT_HOST = '127.0.0.1';
+
+/** Per-file cap on inbound attachments (decoded bytes). The web app enforces
+ * the same ceiling client- and server-side; this is the last line of defence
+ * before a file is written into the session inbox. */
+const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+/** Most files per message. Keeps a single turn's prompt (and the inbox write
+ * burst) bounded. */
+const MAX_ATTACHMENTS = 8;
+/** Body ceiling for POST /messages. Attachments ride as base64 (≈+33% over
+ * raw bytes); this admits MAX_ATTACHMENTS files near the per-file cap plus the
+ * surrounding JSON. Replaces the default 1MB readJsonBody limit for this route
+ * only — every other route keeps the tight default. */
+const INBOUND_BODY_LIMIT = MAX_ATTACHMENTS * MAX_ATTACHMENT_BYTES * 2;
+
+interface InboundAttachment {
+  type: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  data: string;
+}
+
+/** Coarse attachment class from a MIME type — drives the `[image: …]` vs
+ * `[document: …]` label the agent-runner's formatter shows the model. */
+function attachmentTypeFor(mimeType: string): string {
+  if (mimeType.startsWith('image/')) return 'image';
+  if (mimeType.startsWith('audio/')) return 'audio';
+  if (mimeType.startsWith('video/')) return 'video';
+  return 'document';
+}
+
+/**
+ * Validate + normalize the inbound `attachments` field.
+ *
+ * Returns the cleaned array on success, or `null` when the payload is present
+ * but malformed (too many files, a file over the size cap, or a non-base64
+ * `data` blob). `undefined`/missing yields an empty array — attachments are
+ * optional. The host (session-manager.extractAttachmentFiles) is the component
+ * that actually writes these to disk; we only guarantee shape + size here.
+ */
+function normalizeInboundAttachments(raw: unknown): InboundAttachment[] | null {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) return null;
+  if (raw.length > MAX_ATTACHMENTS) return null;
+
+  const out: InboundAttachment[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') return null;
+    const a = item as Record<string, unknown>;
+    if (typeof a.name !== 'string' || !a.name) return null;
+    if (typeof a.mimeType !== 'string' || !a.mimeType) return null;
+    if (typeof a.data !== 'string' || !a.data) return null;
+
+    // Decode-length check without allocating the buffer: every 4 base64 chars
+    // are 3 bytes, minus padding. Rejects oversize files before we hand the
+    // string downstream.
+    const b64 = a.data;
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) return null;
+    const padding = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0;
+    const decodedBytes = Math.floor((b64.length * 3) / 4) - padding;
+    if (decodedBytes <= 0 || decodedBytes > MAX_ATTACHMENT_BYTES) return null;
+
+    out.push({
+      type: typeof a.type === 'string' && a.type ? a.type : attachmentTypeFor(a.mimeType),
+      name: a.name,
+      mimeType: a.mimeType,
+      size: typeof a.size === 'number' && a.size > 0 ? a.size : decodedBytes,
+      data: b64,
+    });
+  }
+  return out;
+}
 
 // WEB_BASE_URL imported at top alongside the other module-scope
 // imports — kept as the host-wide single source of truth so this
@@ -837,9 +914,20 @@ function createAdapter(): ChannelAdapter | null {
     res: http.ServerResponse,
     config: ChannelSetup,
   ): Promise<void> {
-    let body: { userId?: unknown; text?: unknown; displayName?: unknown; threadId?: unknown };
+    let body: {
+      userId?: unknown;
+      text?: unknown;
+      displayName?: unknown;
+      threadId?: unknown;
+      attachments?: unknown;
+    };
     try {
-      body = (await readJsonBody(req)) as typeof body;
+      // Larger limit than the default 1MB — inbound attachments ride as base64
+      // in the JSON body (the host's session-manager extracts them to the
+      // session inbox and hands the agent a file path). Base64 inflates the raw
+      // bytes by ~33%, so this ceiling admits files up to ~MAX_ATTACHMENT_BYTES
+      // while leaving headroom for the encoding and the rest of the body.
+      body = (await readJsonBody(req, INBOUND_BODY_LIMIT)) as typeof body;
     } catch (err) {
       writeJson(res, 400, { error: 'invalid json', detail: (err as Error).message });
       return;
@@ -848,11 +936,19 @@ function createAdapter(): ChannelAdapter | null {
       writeJson(res, 400, { error: 'userId required' });
       return;
     }
-    if (typeof body.text !== 'string' || !body.text) {
-      writeJson(res, 400, { error: 'text required' });
+    const attachments = normalizeInboundAttachments(body.attachments);
+    if (attachments === null) {
+      writeJson(res, 400, { error: 'invalid attachments' });
+      return;
+    }
+    // A message must carry text OR at least one attachment. A bare "here's a
+    // file" upload is valid even with an empty caption.
+    if ((typeof body.text !== 'string' || !body.text) && attachments.length === 0) {
+      writeJson(res, 400, { error: 'text or attachments required' });
       return;
     }
     const userId = body.userId;
+    const text = typeof body.text === 'string' ? body.text : '';
     const platformId = platformIdFor(userId);
     const displayName = typeof body.displayName === 'string' ? body.displayName : userId;
     const threadId = typeof body.threadId === 'string' ? body.threadId : null;
@@ -868,9 +964,15 @@ function createAdapter(): ChannelAdapter | null {
         isMention: true,
         isGroup: false,
         content: {
-          text: body.text,
+          text,
           sender: displayName,
           senderId: `web:${userId}`,
+          // Base64 `data` is consumed host-side by session-manager's
+          // extractAttachmentFiles(): it writes each file into the session
+          // inbox, strips `data`, and sets `localPath` so the agent can Read
+          // it. Omit the key entirely when there are no files so we don't
+          // perturb the existing text-only content shape.
+          ...(attachments.length ? { attachments } : {}),
         },
       });
       writeJson(res, 202, { id: platformId });
