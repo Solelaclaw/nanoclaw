@@ -103,6 +103,37 @@ const CHANNEL_TYPE = 'web';
 const DEFAULT_PORT = 11000;
 const DEFAULT_HOST = '127.0.0.1';
 
+/**
+ * Parse a session-DB timestamp into epoch millis.
+ *
+ * The two session DBs write different formats for the same instant, and
+ * both mean UTC:
+ *
+ *   messages_in  — `new Date().toISOString()` → "2026-07-17T12:53:00.000Z"
+ *   messages_out — SQLite `datetime('now')`   → "2026-07-17 12:53:00"
+ *
+ * `Date.parse` reads the second as *local* time — it carries no zone
+ * marker and isn't ISO-8601, so the spec leaves it implementation-defined
+ * and V8 assumes local. On any host that isn't UTC that shifts every
+ * assistant row by the host's offset, which is enough to sort the entire
+ * agent side of a transcript before the user side (a UTC+3 host puts every
+ * reply 3h in the past). The bug is invisible on a UTC host, which is why
+ * it survived this long. Normalize to explicit UTC rather than trusting
+ * Date.parse to guess.
+ *
+ * Returns NaN for anything unparseable — callers drop those rows, which
+ * beats the old `|| 0` that silently sorted them to epoch zero.
+ */
+export function parseSessionTimestamp(ts: string): number {
+  if (typeof ts !== 'string' || !ts) return NaN;
+  // Already carries a zone (ISO-8601 with Z or ±HH:MM) — unambiguous.
+  if (/([Zz]|[+-]\d{2}:?\d{2})$/.test(ts)) return Date.parse(ts);
+  // SQLite datetime()/CURRENT_TIMESTAMP: "YYYY-MM-DD HH:MM:SS[.sss]",
+  // always UTC, no marker. Make that explicit before parsing.
+  const iso = ts.includes('T') ? ts : ts.replace(' ', 'T');
+  return Date.parse(`${iso}Z`);
+}
+
 // WEB_BASE_URL imported at top alongside the other module-scope
 // imports — kept as the host-wide single source of truth so this
 // channel's card-lift uses the exact same value as
@@ -2928,6 +2959,9 @@ function createAdapter(): ChannelAdapter | null {
    * under `data/v2-sessions/<agentGroupId>/<sessionId>/`, sorts by
    * timestamp ASC, returns the most recent `limit` rows.
    *
+   * `timestamp` is emitted as ISO-8601 UTC regardless of how the row was
+   * stored — see parseSessionTimestamp for why the two DBs disagree.
+   *
    * The endpoint stays read-only and stateless — no caching, no copies
    * to Postgres. Per the V2 privacy decision the transcript lives only
    * on the VM; this endpoint exposes it back to the web app per request
@@ -2986,11 +3020,16 @@ function createAdapter(): ChannelAdapter | null {
               )
               .all(limit) as { id: string; kind: string; content: string; timestamp: string }[];
             for (const r of rows) {
-              merged.push({
-                ...r,
-                role: 'assistant',
-                _ts: Date.parse(r.timestamp) || 0,
-              });
+              const _ts = parseSessionTimestamp(r.timestamp);
+              if (Number.isNaN(_ts)) {
+                log.warn('chat-history: unparseable timestamp, dropping row', {
+                  sessionDirName,
+                  id: r.id,
+                  timestamp: r.timestamp,
+                });
+                continue;
+              }
+              merged.push({ ...r, role: 'assistant', _ts });
             }
           } finally {
             db.close();
@@ -3018,11 +3057,16 @@ function createAdapter(): ChannelAdapter | null {
               )
               .all(limit) as { id: string; kind: string; content: string; timestamp: string }[];
             for (const r of rows) {
-              merged.push({
-                ...r,
-                role: 'user',
-                _ts: Date.parse(r.timestamp) || 0,
-              });
+              const _ts = parseSessionTimestamp(r.timestamp);
+              if (Number.isNaN(_ts)) {
+                log.warn('chat-history: unparseable timestamp, dropping row', {
+                  sessionDirName,
+                  id: r.id,
+                  timestamp: r.timestamp,
+                });
+                continue;
+              }
+              merged.push({ ...r, role: 'user', _ts });
             }
           } finally {
             db.close();
@@ -3033,14 +3077,19 @@ function createAdapter(): ChannelAdapter | null {
       }
     }
 
-    // Sort ASC by timestamp, keep the most recent `limit` rows.
+    // Sort ASC by timestamp, keep the most recent `limit` rows. The trim
+    // happens after the sort, so a mis-parsed row wouldn't just render out
+    // of order — it would be the one dropped when a transcript overflows.
     merged.sort((a, b) => a._ts - b._ts);
     const trimmed = merged.slice(-limit).map((r) => ({
       id: r.id,
       role: r.role,
       kind: r.kind,
       content: r.content,
-      timestamp: r.timestamp,
+      // Normalized to ISO-8601 UTC. The underlying rows are a mix of
+      // toISOString() (inbound) and SQLite datetime() (outbound); emitting
+      // that mix would hand every consumer the same parsing trap.
+      timestamp: new Date(r._ts).toISOString(),
     }));
 
     writeJson(res, 200, { messages: trimmed });
