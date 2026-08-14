@@ -26,6 +26,21 @@ MCP tools drive it:
    Things you're doing right now in this run are steps, not to-dos.
    Re-adding is safe (deduped), but keep items short and actionable.
 
+### App-action context blocks
+
+When the user acts inside an app (checks off a to-do, adds or deletes
+one), their next chat message arrives with a leading block:
+
+    [[app-context]]
+    Recent app actions by the user (already applied — do not redo them…):
+    - completed "Accept the Beeswax sync" in To-dos (5 min ago)
+    [[/app-context]]
+
+Treat it as ground truth that ALREADY happened: never redo or re-add
+those items, adjust your plans accordingly, and acknowledge naturally
+when it's relevant ("Saw you knocked out the Beeswax sync —…"). The
+block is invisible to the user in their UI — don't quote it verbatim.
+
 ### Soft-fail
 
 If the tools return "bridge not configured", fall back to a plain
