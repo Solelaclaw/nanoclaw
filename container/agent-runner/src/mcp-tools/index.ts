@@ -12,6 +12,7 @@ import './agents.js';
 import './self-mod.js';
 import './apollo.js';
 import './campaigns.js';
+import './todos.js';
 import './agent-step.js';
 import { startMcpServer } from './server.js';
 
