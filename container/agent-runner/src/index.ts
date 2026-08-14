@@ -27,6 +27,7 @@ import { fileURLToPath } from 'url';
 
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
+import { getSessionRouting } from './db/session-routing.js';
 import { initOtel } from './observability/otel.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
@@ -57,7 +58,42 @@ async function main(): Promise<void> {
   // /workspace/agent/CLAUDE.md — the composed entry imports the shared
   // base (/app/CLAUDE.md) and each enabled module's fragment. Per-group
   // memory lives in /workspace/agent/CLAUDE.local.md (auto-loaded).
-  const instructions = buildSystemPromptAddendum(config.assistantName || undefined);
+  let instructions = buildSystemPromptAddendum(config.assistantName || undefined);
+
+  // Context recall — SolelApp To-dos. Fetch the user's open items at
+  // boot and fold them into the system context so the agent knows its
+  // shared list without a tool call ("what's on my plate" answers
+  // instantly; completed work gets closed via todo_complete). Soft-fail
+  // with a tight timeout: a slow or unconfigured bridge must never
+  // delay agent startup.
+  try {
+    const bridgeUrl = process.env.SOLELACLAWDE_API_URL?.replace(/\/+$/, '');
+    const bridgeToken = process.env.SOLELACLAWDE_AGENT_API_TOKEN;
+    const routing = getSessionRouting();
+    if (bridgeUrl && bridgeToken && routing.platform_id) {
+      const res = await fetch(`${bridgeUrl}/api/internal/agent/todos`, {
+        headers: {
+          Authorization: `Bearer ${bridgeToken}`,
+          'X-Acting-Platform-Id': routing.platform_id,
+        },
+        signal: AbortSignal.timeout(3000),
+      });
+      if (res.ok) {
+        const body = (await res.json()) as {
+          todos?: Array<{ id: string; text: string; done: boolean }>;
+        };
+        const open = (body.todos ?? []).filter((t) => !t.done).slice(0, 15);
+        if (open.length > 0) {
+          instructions += `\n\n## Open to-dos (shared list — manage via todo_list / todo_add / todo_complete)\n${open
+            .map((t) => `- [id: ${t.id}] ${t.text}`)
+            .join('\n')}`;
+          log(`Loaded ${open.length} open to-dos into context`);
+        }
+      }
+    }
+  } catch {
+    // Bridge unreachable — the agent still has the todo_* tools.
+  }
 
   // Discover additional directories mounted at /workspace/extra/*
   const additionalDirectories: string[] = [];
