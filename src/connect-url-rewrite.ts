@@ -44,11 +44,7 @@ import { readEnvFile } from './env.js';
  *  (dev / local testing without the env file present). */
 export const WEB_BASE_URL = (() => {
   const env = readEnvFile(['SOLELACLAWDE_PUBLIC_URL', 'SOLELACLAWDE_WEB_BASE_URL']);
-  return (
-    env.SOLELACLAWDE_PUBLIC_URL ??
-    env.SOLELACLAWDE_WEB_BASE_URL ??
-    'http://localhost:3000'
-  ).replace(/\/+$/, '');
+  return (env.SOLELACLAWDE_PUBLIC_URL ?? env.SOLELACLAWDE_WEB_BASE_URL ?? 'http://localhost:3000').replace(/\/+$/, '');
 })();
 
 /**

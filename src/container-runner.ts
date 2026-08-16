@@ -450,22 +450,13 @@ async function buildContainerArgs(
     }
   }
   if (process.env.OTEL_EXPORTER_OTLP_ENDPOINT) {
-    args.push(
-      '-e',
-      `OTEL_EXPORTER_OTLP_ENDPOINT=${process.env.OTEL_EXPORTER_OTLP_ENDPOINT}`,
-    );
+    args.push('-e', `OTEL_EXPORTER_OTLP_ENDPOINT=${process.env.OTEL_EXPORTER_OTLP_ENDPOINT}`);
   }
   if (process.env.OTEL_EXPORTER_OTLP_HEADERS) {
-    args.push(
-      '-e',
-      `OTEL_EXPORTER_OTLP_HEADERS=${process.env.OTEL_EXPORTER_OTLP_HEADERS}`,
-    );
+    args.push('-e', `OTEL_EXPORTER_OTLP_HEADERS=${process.env.OTEL_EXPORTER_OTLP_HEADERS}`);
   }
   if (process.env.NANOCLAW_AGENT_RUNNER_VERSION) {
-    args.push(
-      '-e',
-      `NANOCLAW_AGENT_RUNNER_VERSION=${process.env.NANOCLAW_AGENT_RUNNER_VERSION}`,
-    );
+    args.push('-e', `NANOCLAW_AGENT_RUNNER_VERSION=${process.env.NANOCLAW_AGENT_RUNNER_VERSION}`);
   }
 
   // Apollo API key — used by the apollo_search_prospects /

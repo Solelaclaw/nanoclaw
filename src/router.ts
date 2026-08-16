@@ -535,11 +535,7 @@ function messageIdForAgent(baseId: string | undefined, agentGroupId: string): st
  * before us, so on the very first inbound the count is exactly 1 and
  * we reply; on subsequent inbounds the count is >= 2 and we skip.
  */
-async function sendPairingReplyOnce(
-  mg: MessagingGroup,
-  event: InboundEvent,
-  adapter: ChannelAdapter,
-): Promise<void> {
+async function sendPairingReplyOnce(mg: MessagingGroup, event: InboundEvent, adapter: ChannelAdapter): Promise<void> {
   // Only Telegram + WhatsApp need this. Web / Slack / Discord / etc.
   // either don't have a cold-DM problem or have channel-specific
   // patterns we'd want to design separately.
@@ -553,11 +549,12 @@ async function sendPairingReplyOnce(
   // Dedup: only reply on the *first* drop for this messaging_group.
   // The drop count includes the row we just recorded for this same
   // event, so the first-time count is 1.
-  const dropCount = (
-    getDb()
-      .prepare(`SELECT COUNT(*) AS c FROM dropped_messages WHERE messaging_group_id = ?`)
-      .get(mg.id) as { c: number } | undefined
-  )?.c ?? 0;
+  const dropCount =
+    (
+      getDb().prepare(`SELECT COUNT(*) AS c FROM dropped_messages WHERE messaging_group_id = ?`).get(mg.id) as
+        | { c: number }
+        | undefined
+    )?.c ?? 0;
   if (dropCount !== 1) return;
 
   const channelPath = event.channelType.startsWith('whatsapp') ? 'whatsapp' : 'telegram';
