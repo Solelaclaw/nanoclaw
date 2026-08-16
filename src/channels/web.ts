@@ -8,7 +8,8 @@
  *   POST /messages              — write one inbound chat from a user
  *     headers:  X-Solelaclawde-Token: <SOLELACLAWDE_WEB_CHANNEL_TOKEN>
  *     body:     { userId: string, text?: string,
- *                 displayName?: string, threadId?: string|null,
+ *                 displayName?: string, conversationId?: string|null,
+ *                 threadId?: string|null,
  *                 attachments?: { name, mimeType, data (base64),
  *                                 size?, type? }[] }
  *     returns:  { id: string }            (the platform_id that routed it)
@@ -107,6 +108,8 @@ import { getRegisteredChannelNames, registerChannelAdapter } from './channel-reg
 const CHANNEL_TYPE = 'web';
 const DEFAULT_PORT = 11000;
 const DEFAULT_HOST = '127.0.0.1';
+const CONVERSATION_ID_RE = /^[A-Za-z0-9_-]{16,80}$/;
+const LEGACY_CONVERSATION_ID = 'legacy-first-chat';
 
 /**
  * Parse a session-DB timestamp into epoch millis.
@@ -128,6 +131,13 @@ const DEFAULT_HOST = '127.0.0.1';
  *
  * Returns NaN for anything unparseable — callers drop those rows, which
  * beats the old `|| 0` that silently sorted them to epoch zero.
+ *
+ * Kept as a standalone exported utility (covered by
+ * web-chat-history-timestamp.test.ts) even though this channel's own
+ * chat-history endpoint below uses its own equivalent, differently-named
+ * parseSqliteTimestamp() — the two were written independently and both
+ * solve the same non-UTC-host bug; left as-is rather than unified, since
+ * unifying them is out of scope for this change.
  */
 export function parseSessionTimestamp(ts: string): number {
   if (typeof ts !== 'string' || !ts) return NaN;
@@ -233,6 +243,12 @@ interface SseClient {
 
 function platformIdFor(userId: string): string {
   return `web:${userId}`;
+}
+
+function conversationTitle(text: string): string {
+  const compact = text.replace(/\s+/g, ' ').trim();
+  if (!compact) return 'New conversation';
+  return compact.length > 56 ? `${compact.slice(0, 53).trimEnd()}…` : compact;
 }
 
 /**
@@ -654,7 +670,7 @@ function createAdapter(): ChannelAdapter | null {
   const adapter: ChannelAdapter = {
     name: 'web',
     channelType: CHANNEL_TYPE,
-    supportsThreads: false,
+    supportsThreads: true,
 
     async setup(config: ChannelSetup): Promise<void> {
       server = http.createServer((req, res) => {
@@ -687,6 +703,11 @@ function createAdapter(): ChannelAdapter | null {
 
         if (req.method === 'GET' && url === '/admin/channels') {
           handleChannels(res);
+          return;
+        }
+
+        if (req.method === 'GET' && url.startsWith('/admin/chat-sessions')) {
+          handleChatSessions(res, url);
           return;
         }
 
@@ -868,17 +889,18 @@ function createAdapter(): ChannelAdapter | null {
       return server !== null;
     },
 
-    async deliver(platformId, _threadId, message: OutboundMessage): Promise<string | undefined> {
+    async deliver(platformId, threadId, message: OutboundMessage): Promise<string | undefined> {
       const userId = userIdFromPlatformId(platformId);
       if (!userId) return undefined;
       const content = message.content as Record<string, unknown> | undefined;
+      const conversation = { conversationId: threadId ?? LEGACY_CONVERSATION_ID };
 
       // Step payload — emitted by the agent's `agent_step` MCP tool.
       // Renders as a Perplexity-style progress line in the chat. The
       // chat client groups consecutive steps + auto-collapses the
       // group when the next non-step message arrives.
       if (content && content.type === 'step' && typeof content.title === 'string') {
-        broadcast(userId, { step: { title: content.title } });
+        broadcast(userId, { ...conversation, step: { title: content.title } });
         return undefined;
       }
 
@@ -888,7 +910,11 @@ function createAdapter(): ChannelAdapter | null {
       // start URL on the OneCLI dashboard, without ever leaving the
       // conversation.
       if (content && content.type === 'card' && content.card) {
-        broadcast(userId, { card: content.card, fallbackText: content.fallbackText });
+        broadcast(userId, {
+          ...conversation,
+          card: content.card,
+          fallbackText: content.fallbackText,
+        });
         return undefined;
       }
 
@@ -901,6 +927,7 @@ function createAdapter(): ChannelAdapter | null {
       // owns the visual layout.
       if (content && content.type === 'carousel' && Array.isArray(content.items)) {
         broadcast(userId, {
+          ...conversation,
           carousel: content.items,
           fallbackText: content.fallbackText,
         });
@@ -920,20 +947,167 @@ function createAdapter(): ChannelAdapter | null {
       // lose context.
       const promoted = promoteOneCliConnectToCard(text);
       if (promoted) {
-        broadcast(userId, { card: promoted.card, fallbackText: promoted.fallbackText });
+        broadcast(userId, {
+          ...conversation,
+          card: promoted.card,
+          fallbackText: promoted.fallbackText,
+        });
         return undefined;
       }
 
-      broadcast(userId, { text });
+      broadcast(userId, { ...conversation, text });
       return undefined;
     },
 
-    async setTyping(platformId: string): Promise<void> {
+    async setTyping(platformId: string, threadId?: string | null): Promise<void> {
       const userId = userIdFromPlatformId(platformId);
       if (!userId) return;
-      broadcast(userId, { typing: true });
+      broadcast(userId, {
+        conversationId: threadId ?? LEGACY_CONVERSATION_ID,
+        typing: true,
+      });
     },
   };
+
+  interface LegacyWebSession {
+    id: string;
+    messaging_group_id: string | null;
+    status: string | null;
+    last_active: string | null;
+    created_at: string;
+    indexed: boolean;
+  }
+
+  function hasWebAgentAccess(userId: string, agentGroupId: string): boolean {
+    return Boolean(
+      getDb()
+        .prepare(
+          `SELECT 1
+             FROM messaging_group_agents mga
+             JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+            WHERE mga.agent_group_id = ?
+              AND mg.channel_type = ?
+              AND mg.platform_id = ?
+            LIMIT 1`,
+        )
+        .get(agentGroupId, CHANNEL_TYPE, platformIdFor(userId)),
+    );
+  }
+
+  /** Return every pre-multi-session null-thread session folder for this user and agent. */
+  function findLegacyWebSessions(userId: string, agentGroupId: string): LegacyWebSession[] {
+    interface IndexedSession {
+      id: string;
+      messaging_group_id: string | null;
+      thread_id: string | null;
+      status: string;
+      last_active: string | null;
+      created_at: string;
+    }
+
+    const indexedRows = getDb()
+      .prepare(
+        `SELECT id, messaging_group_id, thread_id, status, last_active, created_at
+           FROM sessions
+          WHERE agent_group_id = ?`,
+      )
+      .all(agentGroupId) as IndexedSession[];
+    const indexedById = new Map(indexedRows.map((row) => [row.id, row]));
+    const sessionsRoot = path.join(DATA_DIR, 'v2-sessions', agentGroupId);
+    if (!fs.existsSync(sessionsRoot)) return [];
+
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(sessionsRoot, { withFileTypes: true });
+    } catch (err) {
+      log.warn('chat-sessions: failed listing legacy session folders', { agentGroupId, err });
+      return [];
+    }
+
+    const sessions: LegacyWebSession[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !entry.name.startsWith('sess-')) continue;
+      const indexed = indexedById.get(entry.name);
+      if (indexed?.thread_id) continue;
+
+      const inboundPath = path.join(sessionsRoot, entry.name, 'inbound.db');
+      if (!fs.existsSync(inboundPath)) continue;
+      try {
+        const db = new BetterSqlite3(inboundPath, { readonly: true, fileMustExist: true });
+        try {
+          const transcript = db
+            .prepare(
+              `SELECT COUNT(*) AS message_count,
+                      MIN(timestamp) AS first_message_at,
+                      MAX(timestamp) AS last_message_at
+                 FROM messages_in
+                WHERE channel_type = ?
+                  AND platform_id = ?
+                  AND thread_id IS NULL`,
+            )
+            .get(CHANNEL_TYPE, platformIdFor(userId)) as {
+            message_count: number;
+            first_message_at: string | null;
+            last_message_at: string | null;
+          };
+          if (transcript.message_count === 0) continue;
+
+          const fallbackTimestamp = new Date(fs.statSync(inboundPath).mtimeMs).toISOString();
+          sessions.push({
+            id: entry.name,
+            messaging_group_id: indexed?.messaging_group_id ?? null,
+            status: indexed?.status ?? null,
+            created_at: indexed?.created_at ?? transcript.first_message_at ?? fallbackTimestamp,
+            last_active: transcript.last_message_at ?? indexed?.last_active ?? fallbackTimestamp,
+            indexed: indexed !== undefined,
+          });
+        } finally {
+          db.close();
+        }
+      } catch (err) {
+        log.warn('chat-sessions: failed checking legacy web session', {
+          sessionId: entry.name,
+          err,
+        });
+      }
+    }
+
+    return sessions.sort((a, b) => {
+      const activeDifference = Number(b.indexed && b.status === 'active') - Number(a.indexed && a.status === 'active');
+      if (activeDifference !== 0) return activeDifference;
+      return (b.last_active ?? b.created_at).localeCompare(a.last_active ?? a.created_at);
+    });
+  }
+
+  /** Re-attach an orphaned or closed legacy web folder to the current web wiring. */
+  function attachLegacyWebSession(session: LegacyWebSession, agentGroupId: string, messagingGroupId: string): void {
+    const existing = getDb().prepare('SELECT agent_group_id FROM sessions WHERE id = ?').get(session.id) as
+      | { agent_group_id: string }
+      | undefined;
+
+    if (existing && existing.agent_group_id !== agentGroupId) {
+      throw new Error(`legacy session ${session.id} belongs to a different agent group`);
+    }
+    if (existing) {
+      getDb()
+        .prepare(
+          `UPDATE sessions
+              SET messaging_group_id = ?, thread_id = NULL, status = 'active'
+            WHERE id = ?`,
+        )
+        .run(messagingGroupId, session.id);
+      return;
+    }
+
+    getDb()
+      .prepare(
+        `INSERT INTO sessions
+           (id, agent_group_id, messaging_group_id, thread_id, agent_provider,
+            status, container_status, last_active, created_at)
+         VALUES (?, ?, ?, NULL, NULL, 'active', 'stopped', ?, ?)`,
+      )
+      .run(session.id, agentGroupId, messagingGroupId, session.last_active, session.created_at);
+  }
 
   async function handleInbound(
     req: http.IncomingMessage,
@@ -944,6 +1118,7 @@ function createAdapter(): ChannelAdapter | null {
       userId?: unknown;
       text?: unknown;
       displayName?: unknown;
+      conversationId?: unknown;
       threadId?: unknown;
       attachments?: unknown;
     };
@@ -977,10 +1152,56 @@ function createAdapter(): ChannelAdapter | null {
     const text = typeof body.text === 'string' ? body.text : '';
     const platformId = platformIdFor(userId);
     const displayName = typeof body.displayName === 'string' ? body.displayName : userId;
-    const threadId = typeof body.threadId === 'string' ? body.threadId : null;
+    const requestedConversationId =
+      typeof body.conversationId === 'string'
+        ? body.conversationId
+        : typeof body.threadId === 'string'
+          ? body.threadId
+          : null;
+    if (requestedConversationId !== null && !CONVERSATION_ID_RE.test(requestedConversationId)) {
+      writeJson(res, 400, { error: 'invalid conversationId' });
+      return;
+    }
+    const conversationId = requestedConversationId === LEGACY_CONVERSATION_ID ? null : requestedConversationId;
 
     try {
-      await config.onInbound(platformId, threadId, {
+      const mg = getMessagingGroupByPlatform(CHANNEL_TYPE, platformId);
+      if (!mg) {
+        writeJson(res, 404, { error: 'web assistant not provisioned' });
+        return;
+      }
+
+      // Existing users were provisioned before conversation-scoped sessions.
+      // Upgrade their private web wiring in place on the first scoped send.
+      if (conversationId) {
+        if (mg.is_group === 0) updateMessagingGroup(mg.id, { is_group: 1 });
+        getDb()
+          .prepare("UPDATE messaging_group_agents SET session_mode = 'per-thread' WHERE messaging_group_id = ?")
+          .run(mg.id);
+      } else {
+        // A legacy agent-shared session can be closed, missing from the
+        // central index, or attached to another channel's messaging group.
+        // Reattach the newest readable web transcript before continuing it.
+        const wiring = getDb()
+          .prepare(
+            `SELECT agent_group_id
+               FROM messaging_group_agents
+              WHERE messaging_group_id = ?
+              ORDER BY priority ASC, created_at ASC
+              LIMIT 1`,
+          )
+          .get(mg.id) as { agent_group_id: string } | undefined;
+        const legacySession = wiring ? findLegacyWebSessions(userId, wiring.agent_group_id)[0] : null;
+        if (
+          wiring &&
+          legacySession &&
+          (!legacySession.indexed || legacySession.status !== 'active' || legacySession.messaging_group_id !== mg.id)
+        ) {
+          attachLegacyWebSession(legacySession, wiring.agent_group_id, mg.id);
+        }
+      }
+
+      await config.onInbound(platformId, conversationId, {
         id: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         kind: 'chat',
         timestamp: new Date().toISOString(),
@@ -1001,7 +1222,7 @@ function createAdapter(): ChannelAdapter | null {
           ...(attachments.length ? { attachments } : {}),
         },
       });
-      writeJson(res, 202, { id: platformId });
+      writeJson(res, 202, { id: platformId, conversationId });
     } catch (err) {
       log.error('Web channel inbound failed', { err });
       writeJson(res, 500, { error: 'inbound failed' });
@@ -1318,7 +1539,9 @@ function createAdapter(): ChannelAdapter | null {
           channel_type: 'web',
           platform_id: platformId,
           name: displayName,
-          is_group: 0,
+          // Synthetic group: still a private web surface, but thread-capable
+          // so NanoClaw preserves each visible conversation id.
+          is_group: 1,
           unknown_sender_policy: 'strict',
           created_at: now,
         });
@@ -1336,12 +1559,7 @@ function createAdapter(): ChannelAdapter | null {
           engage_pattern: '.',
           sender_scope: 'all',
           ignored_message_policy: 'drop',
-          // 'agent-shared' — one session per agent_group, ALL messaging_groups
-          // (web, WhatsApp, Telegram, …) share it. Same memory across channels.
-          // The alternative 'shared' (one session per messaging_group) gives
-          // the user separate memories per channel, which is wrong for the
-          // SoleLaClawde single-assistant-per-user model.
-          session_mode: 'agent-shared',
+          session_mode: 'per-thread',
           priority: 0,
           created_at: now,
         });
@@ -1407,9 +1625,8 @@ function createAdapter(): ChannelAdapter | null {
       writeJson(res, 404, { error: 'web messaging group not found', detail: `no mg for ${platformId}` });
       return;
     }
-    // session_mode 'shared' matches the wiring set up by handleProvision
-    // (DMs match every message via engage_pattern='.', no threading).
-    const { session } = resolveSession(ag.id, mg.id, null, 'shared');
+    // The null thread is the user's pre-multi-session conversation.
+    const { session } = resolveSession(ag.id, mg.id, null, 'per-thread');
 
     // Fire-and-forget. wakeContainer returns false on transient spawn
     // failure but never throws — log + 202 either way.
@@ -3051,49 +3268,174 @@ function createAdapter(): ChannelAdapter | null {
   }
 
   /**
-   * Read-through chat history for the web channel.
-   *
-   * GET /admin/chat-history?agentGroupId=<id>&limit=50
-   *   → { messages: [{ id, role, kind, content, timestamp }, ...] }
-   *
-   * Merges every session's `inbound.db` (web-channel rows only — we don't
-   * leak Telegram/WhatsApp transcripts into the web UI) and `outbound.db`
-   * under `data/v2-sessions/<agentGroupId>/<sessionId>/`, sorts by
-   * timestamp ASC, returns the most recent `limit` rows.
-   *
-   * `timestamp` is emitted as ISO-8601 UTC regardless of how the row was
-   * stored — see parseSessionTimestamp for why the two DBs disagree.
-   *
-   * The endpoint stays read-only and stateless — no caching, no copies
-   * to Postgres. Per the V2 privacy decision the transcript lives only
-   * on the VM; this endpoint exposes it back to the web app per request
-   * so users see history on reload without us persisting it anywhere
-   * else. Shape conversion (content JSON → UiMessage carousel/card/text)
-   * happens in the solelaclawde bridge layer, NOT here.
-   *
-   * Caller scoping is on the web-app side: only that user's own agent
-   * group id is sent (resolved from their Supabase session), so the
-   * existing bridge-token auth + the platform_id ↔ assistant mapping
-   * are the only access controls in play. We deliberately do NOT
-   * cross-check the agentGroupId against the bridge token's caller —
-   * the web app is the trust boundary here.
+   * List the signed-in user's persisted web conversations.
+   * GET /admin/chat-sessions?userId=<id>&agentGroupId=<id>
    */
-  function handleChatHistory(res: http.ServerResponse, url: string): void {
+  function handleChatSessions(res: http.ServerResponse, url: string): void {
     const parsed = new URL(url, 'http://x');
+    const userId = parsed.searchParams.get('userId');
     const agentGroupId = parsed.searchParams.get('agentGroupId');
-    const limit = Math.min(Math.max(parseInt(parsed.searchParams.get('limit') ?? '50', 10) || 50, 1), 200);
-    if (!agentGroupId) {
-      writeJson(res, 400, { error: 'agentGroupId required' });
+    if (!userId || !agentGroupId) {
+      writeJson(res, 400, { error: 'userId and agentGroupId required' });
+      return;
+    }
+    if (!hasWebAgentAccess(userId, agentGroupId)) {
+      writeJson(res, 403, { error: 'agent group not owned by user' });
       return;
     }
 
-    const sessionsRoot = path.join(DATA_DIR, 'v2-sessions', agentGroupId);
-    if (!fs.existsSync(sessionsRoot)) {
+    interface SessionRow {
+      id: string;
+      thread_id: string;
+      last_active: string;
+      created_at: string;
+    }
+
+    const rows = getDb()
+      .prepare(
+        `SELECT s.id, s.thread_id, s.last_active, s.created_at
+           FROM sessions s
+           JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+           JOIN messaging_group_agents mga
+             ON mga.messaging_group_id = mg.id
+            AND mga.agent_group_id = s.agent_group_id
+          WHERE s.agent_group_id = ?
+            AND mg.channel_type = ?
+            AND mg.platform_id = ?
+            AND s.thread_id IS NOT NULL
+          ORDER BY s.last_active DESC, s.created_at DESC
+          LIMIT 100`,
+      )
+      .all(agentGroupId, CHANNEL_TYPE, platformIdFor(userId)) as SessionRow[];
+
+    const seen = new Set<string>();
+    const conversations: Array<{
+      id: string;
+      sessionId: string;
+      title: string;
+      createdAt: string;
+      updatedAt: string;
+    }> = [];
+
+    const legacySessions = findLegacyWebSessions(userId, agentGroupId);
+    if (legacySessions.length > 0) {
+      const createdAt = legacySessions.reduce(
+        (earliest, session) => (session.created_at < earliest ? session.created_at : earliest),
+        legacySessions[0].created_at,
+      );
+      const updatedAt = legacySessions.reduce((latest, session) => {
+        const activity = session.last_active ?? session.created_at;
+        return activity > latest ? activity : latest;
+      }, legacySessions[0].last_active ?? legacySessions[0].created_at);
+      conversations.push({
+        id: LEGACY_CONVERSATION_ID,
+        sessionId: legacySessions[0].id,
+        title: 'Previous conversation',
+        createdAt,
+        updatedAt,
+      });
+    }
+
+    for (const row of rows) {
+      if (!CONVERSATION_ID_RE.test(row.thread_id) || seen.has(row.thread_id)) continue;
+      seen.add(row.thread_id);
+      let title = 'Conversation';
+      const inboundPath = path.join(DATA_DIR, 'v2-sessions', agentGroupId, row.id, 'inbound.db');
+      if (fs.existsSync(inboundPath)) {
+        try {
+          const db = new BetterSqlite3(inboundPath, { readonly: true, fileMustExist: true });
+          try {
+            const first = db
+              .prepare(
+                `SELECT content
+                   FROM messages_in
+                  WHERE channel_type = ?
+                  ORDER BY timestamp ASC
+                  LIMIT 1`,
+              )
+              .get(CHANNEL_TYPE) as { content: string } | undefined;
+            if (first) {
+              try {
+                const content = JSON.parse(first.content) as { text?: unknown };
+                if (typeof content.text === 'string') title = conversationTitle(content.text);
+              } catch {
+                title = conversationTitle(first.content);
+              }
+            }
+          } finally {
+            db.close();
+          }
+        } catch (err) {
+          log.warn('chat-sessions: failed reading conversation title', { sessionId: row.id, err });
+        }
+      }
+      conversations.push({
+        id: row.thread_id,
+        sessionId: row.id,
+        title,
+        createdAt: row.created_at,
+        updatedAt: row.last_active,
+      });
+    }
+
+    writeJson(res, 200, { conversations });
+  }
+
+  /**
+   * Read one owner-scoped web conversation directly from its NanoClaw
+   * session databases.
+   *
+   * GET /admin/chat-history?userId=<id>&agentGroupId=<id>&conversationId=<id>&limit=50
+   */
+  function handleChatHistory(res: http.ServerResponse, url: string): void {
+    const parsed = new URL(url, 'http://x');
+    const userId = parsed.searchParams.get('userId');
+    const agentGroupId = parsed.searchParams.get('agentGroupId');
+    const conversationId = parsed.searchParams.get('conversationId');
+    const limit = Math.min(Math.max(parseInt(parsed.searchParams.get('limit') ?? '50', 10) || 50, 1), 200);
+    if (!userId || !agentGroupId || !conversationId) {
+      writeJson(res, 400, { error: 'userId, agentGroupId and conversationId required' });
+      return;
+    }
+    if (!CONVERSATION_ID_RE.test(conversationId)) {
+      writeJson(res, 400, { error: 'invalid conversationId' });
+      return;
+    }
+    if (!hasWebAgentAccess(userId, agentGroupId)) {
+      writeJson(res, 403, { error: 'agent group not owned by user' });
+      return;
+    }
+
+    const isLegacyConversation = conversationId === LEGACY_CONVERSATION_ID;
+    let sessionIds: string[];
+    if (isLegacyConversation) {
+      sessionIds = findLegacyWebSessions(userId, agentGroupId).map((session) => session.id);
+    } else {
+      const session = getDb()
+        .prepare(
+          `SELECT s.id
+             FROM sessions s
+             JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+             JOIN messaging_group_agents mga
+               ON mga.messaging_group_id = mg.id
+              AND mga.agent_group_id = s.agent_group_id
+            WHERE s.agent_group_id = ?
+              AND mg.channel_type = ?
+              AND mg.platform_id = ?
+              AND s.thread_id = ?
+            ORDER BY s.created_at DESC
+            LIMIT 1`,
+        )
+        .get(agentGroupId, CHANNEL_TYPE, platformIdFor(userId), conversationId) as { id: string } | undefined;
+      sessionIds = session ? [session.id] : [];
+    }
+
+    if (sessionIds.length === 0) {
       writeJson(res, 200, { messages: [] });
       return;
     }
 
-    interface Row {
+    interface HistoryRow {
       id: string;
       role: 'user' | 'assistant';
       kind: string;
@@ -3101,100 +3443,103 @@ function createAdapter(): ChannelAdapter | null {
       timestamp: string;
       _ts: number;
     }
-    const merged: Row[] = [];
+    const merged: HistoryRow[] = [];
+    const legacyThreadFilter = isLegacyConversation ? 'AND thread_id IS NULL' : '';
+    const sources: Array<{
+      filename: string;
+      role: 'user' | 'assistant';
+      sql: string;
+      args: unknown[];
+    }> = [
+      {
+        filename: 'inbound.db',
+        role: 'user',
+        sql: `SELECT id, kind, content, timestamp
+                FROM messages_in
+               WHERE channel_type = ?
+                 ${legacyThreadFilter}
+               ORDER BY timestamp DESC
+               LIMIT ?`,
+        args: [CHANNEL_TYPE, limit],
+      },
+      {
+        filename: 'outbound.db',
+        role: 'assistant',
+        sql: `SELECT id, kind, content, timestamp
+                FROM messages_out
+               WHERE (channel_type = ? OR channel_type IS NULL)
+                 ${legacyThreadFilter}
+               ORDER BY timestamp DESC
+               LIMIT ?`,
+        args: [CHANNEL_TYPE, limit],
+      },
+    ];
 
-    for (const sessionDirName of fs.readdirSync(sessionsRoot)) {
-      if (!sessionDirName.startsWith('sess-')) continue;
-      const sessionPath = path.join(sessionsRoot, sessionDirName);
-
-      // Outbound — assistant messages, all kinds (chat / chat-sdk).
-      const outDbPath = path.join(sessionPath, 'outbound.db');
-      if (fs.existsSync(outDbPath)) {
+    for (const sessionId of sessionIds) {
+      const sessionPath = path.join(DATA_DIR, 'v2-sessions', agentGroupId, sessionId);
+      for (const source of sources) {
+        const dbPath = path.join(sessionPath, source.filename);
+        if (!fs.existsSync(dbPath)) continue;
         try {
-          const db = new BetterSqlite3(outDbPath, { readonly: true, fileMustExist: true });
+          const db = new BetterSqlite3(dbPath, { readonly: true, fileMustExist: true });
           try {
-            const rows = db
-              .prepare(
-                `SELECT id, kind, content, timestamp
-                   FROM messages_out
-                  ORDER BY timestamp DESC
-                  LIMIT ?`,
-              )
-              .all(limit) as { id: string; kind: string; content: string; timestamp: string }[];
-            for (const r of rows) {
-              const _ts = parseSessionTimestamp(r.timestamp);
-              if (Number.isNaN(_ts)) {
-                log.warn('chat-history: unparseable timestamp, dropping row', {
-                  sessionDirName,
-                  id: r.id,
-                  timestamp: r.timestamp,
-                });
-                continue;
-              }
-              merged.push({ ...r, role: 'assistant', _ts });
+            const rows = db.prepare(source.sql).all(...source.args) as Array<{
+              id: string;
+              kind: string;
+              content: string;
+              timestamp: string;
+            }>;
+            for (const row of rows) {
+              merged.push({
+                ...row,
+                role: source.role,
+                _ts: parseSqliteTimestamp(row.timestamp),
+              });
             }
           } finally {
             db.close();
           }
         } catch (err) {
-          log.warn('chat-history: failed reading outbound.db', { sessionDirName, err });
-        }
-      }
-
-      // Inbound — user messages. Filter to web channel only so the web
-      // UI doesn't surface Telegram/WhatsApp messages from a shared
-      // agent-shared session.
-      const inDbPath = path.join(sessionPath, 'inbound.db');
-      if (fs.existsSync(inDbPath)) {
-        try {
-          const db = new BetterSqlite3(inDbPath, { readonly: true, fileMustExist: true });
-          try {
-            const rows = db
-              .prepare(
-                `SELECT id, kind, content, timestamp
-                   FROM messages_in
-                  WHERE channel_type = 'web'
-                  ORDER BY timestamp DESC
-                  LIMIT ?`,
-              )
-              .all(limit) as { id: string; kind: string; content: string; timestamp: string }[];
-            for (const r of rows) {
-              const _ts = parseSessionTimestamp(r.timestamp);
-              if (Number.isNaN(_ts)) {
-                log.warn('chat-history: unparseable timestamp, dropping row', {
-                  sessionDirName,
-                  id: r.id,
-                  timestamp: r.timestamp,
-                });
-                continue;
-              }
-              merged.push({ ...r, role: 'user', _ts });
-            }
-          } finally {
-            db.close();
-          }
-        } catch (err) {
-          log.warn('chat-history: failed reading inbound.db', { sessionDirName, err });
+          log.warn('chat-history: failed reading session database', {
+            sessionId,
+            database: source.filename,
+            err,
+          });
         }
       }
     }
 
-    // Sort ASC by timestamp, keep the most recent `limit` rows. The trim
-    // happens after the sort, so a mis-parsed row wouldn't just render out
-    // of order — it would be the one dropped when a transcript overflows.
     merged.sort((a, b) => a._ts - b._ts);
-    const trimmed = merged.slice(-limit).map((r) => ({
-      id: r.id,
-      role: r.role,
-      kind: r.kind,
-      content: r.content,
-      // Normalized to ISO-8601 UTC. The underlying rows are a mix of
-      // toISOString() (inbound) and SQLite datetime() (outbound); emitting
-      // that mix would hand every consumer the same parsing trap.
-      timestamp: new Date(r._ts).toISOString(),
-    }));
+    writeJson(res, 200, {
+      messages: merged.slice(-limit).map(({ _ts, ...row }) => ({
+        ...row,
+        // Emit a proper ISO-UTC timestamp so browsers in any timezone
+        // parse it identically.
+        timestamp: _ts > 0 ? new Date(_ts).toISOString() : row.timestamp,
+      })),
+    });
+  }
 
-    writeJson(res, 200, { messages: trimmed });
+  /**
+   * Parse a session-DB timestamp to epoch ms, treating timezone-less
+   * values as UTC.
+   *
+   * inbound.db stores ISO-UTC ("...T06:43:01.208Z") while outbound.db
+   * stores SQLite's CURRENT_TIMESTAMP ("2026-08-14 06:43:47" — UTC but
+   * with NO zone marker). Bare Date.parse reads the naive form as LOCAL
+   * time, so on a TZ!=UTC host every assistant row sorted hours early
+   * and a user's question rendered below its own answers.
+   */
+  function parseSqliteTimestamp(value: unknown): number {
+    if (typeof value === 'number') {
+      return value > 1e12 ? value : value * 1000;
+    }
+    const raw = String(value ?? '').trim();
+    if (!raw) return 0;
+    const hasZone = /(?:[zZ]|[+-]\d\d:?\d\d)$/.test(raw);
+    const iso = hasZone ? raw : `${raw.replace(' ', 'T')}Z`;
+    const parsed = Date.parse(iso);
+    return Number.isFinite(parsed) ? parsed : 0;
   }
 
   /**
