@@ -12,6 +12,7 @@ const envConfig = readEnvFile([
   'ONECLI_URL',
   'ONECLI_API_KEY',
   'ONECLI_ORG_API_KEY',
+  'OPENAI_API_KEY',
   'TZ',
 ]);
 

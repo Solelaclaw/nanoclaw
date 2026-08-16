@@ -57,14 +57,20 @@ https://www.onecli.sh/docs/guides/credential-stubs/general-app
 
 If you get a 401, 403, or a gateway error (e.g., `app_not_connected`):
 
-**Step 1 — Show the user a connect link.** Use the `connect_url` from the
-error response:
+**Step 1 — Send a connect CTA (never a raw URL).** The user connects
+services through Solela's own web UI. Build the link yourself:
 
-> To connect [service], open this link:
-> [connect_url from the error response]
+    ${SOLELACLAWDE_API_URL}/api/connect/<app-slug>
 
-If there is no `connect_url` in the error, tell the user to open the
-OneCLI dashboard and connect the service there.
+(`SOLELACLAWDE_API_URL` is in your environment; app slugs are the
+provider ids like `gmail`, `outlook-mail`, `google-calendar`.) Present
+it with `send_card` — title "Connect <Service>", one action button —
+never as a bare URL in prose. If you can't determine the slug, send a
+card linking to `${SOLELACLAWDE_API_URL}/connections` ("Open Tools").
+
+**Never show `connect_url` values or any `onecli.sh` link to the user**
+— they have no OneCLI login; those links dead-end on a foreign
+dashboard.
 
 **Step 2 — Retry after the user connects.** Let the user know you will
 retry once they have connected. When they confirm, retry the original
@@ -76,8 +82,8 @@ request. If the retry still fails, ask if they need help with the setup.
   request through the proxy.
 - **Never** use browser extensions, gcloud, or manual auth flows. The
   gateway handles credentials for you.
-- **Never** ask the user for API keys or tokens directly. Direct them to
-  connect the service in the OneCLI dashboard.
+- **Never** ask the user for API keys or tokens directly. Send them a
+  connect card to Solela's own connect flow (see Step 1).
 - **Never** suggest the user open Gmail/Calendar/GitHub in their browser
   when they ask you to read or interact with those services. You have API
   access. Use it.

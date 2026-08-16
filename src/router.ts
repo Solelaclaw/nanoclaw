@@ -31,6 +31,7 @@ import {
 import { findSessionForAgent } from './db/sessions.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
+import { enrichWithTranscription } from './modules/whisper-transcribe.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
@@ -464,6 +465,9 @@ async function deliverToAgent(
     }
   }
 
+  // Enrich audio attachments with Whisper transcription before writing
+  const enrichedContent = await enrichWithTranscription(event.message.content);
+
   writeSessionMessage(session.agent_group_id, session.id, {
     id: messageIdForAgent(event.message.id, agent.agent_group_id),
     kind: event.message.kind,
@@ -471,7 +475,7 @@ async function deliverToAgent(
     platformId: deliveryAddr.platformId,
     channelType: deliveryAddr.channelType,
     threadId: deliveryAddr.threadId,
-    content: event.message.content,
+    content: enrichedContent,
     trigger: wake ? 1 : 0,
   });
 

@@ -50,11 +50,7 @@ const cache = new Map<string, AgentOneCliConfig>();
 const inFlight = new Map<string, Promise<AgentOneCliConfig | null>>();
 
 function getEnv(): { baseUrl: string; bearer: string } | null {
-  const env = readEnvFile([
-    'SOLELACLAWDE_PUBLIC_URL',
-    'SOLELACLAWDE_WEB_BASE_URL',
-    'SOLELACLAWDE_WEB_CHANNEL_TOKEN',
-  ]);
+  const env = readEnvFile(['SOLELACLAWDE_PUBLIC_URL', 'SOLELACLAWDE_WEB_BASE_URL', 'SOLELACLAWDE_WEB_CHANNEL_TOKEN']);
   const baseUrl = (
     process.env.SOLELACLAWDE_PUBLIC_URL ??
     env.SOLELACLAWDE_PUBLIC_URL ??
@@ -80,9 +76,7 @@ function getEnv(): { baseUrl: string; bearer: string } | null {
  * Concurrent calls for the same agent_group_id share one in-flight
  * fetch (no thundering herd at startup).
  */
-export async function fetchAgentOneCliConfig(
-  agentGroupId: string,
-): Promise<AgentOneCliConfig | null> {
+export async function fetchAgentOneCliConfig(agentGroupId: string): Promise<AgentOneCliConfig | null> {
   const hit = cache.get(agentGroupId);
   if (hit) return hit;
 

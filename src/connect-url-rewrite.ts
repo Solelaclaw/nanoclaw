@@ -57,7 +57,7 @@ export const WEB_BASE_URL = (() => {
  * The `g` flag is critical: agents sometimes emit multiple connect
  * links in one message; we rewrite all of them.
  */
-const ONECLI_CONNECT_RE_G = /https?:\/\/[^\s)\]]+\/connections\?[^\s)\]]*\bconnect=([a-z][a-z0-9-]*)\b[^\s)\]]*/gi;
+const ONECLI_CONNECT_RE_G = /https?:\/\/[^\s)\]"]+\/connections\?[^\s)\]"]*\bconnect=([a-z][a-z0-9-]*)\b[^\s)\]"]*/gi;
 
 /**
  * Localhost or otherwise non-prod proxy URL. Same shape as the
@@ -69,7 +69,7 @@ const ONECLI_CONNECT_RE_G = /https?:\/\/[^\s)\]]+\/connections\?[^\s)\]]*\bconne
  * substitutes the same value back. Cost is one extra regex pass per
  * URL — negligible.
  */
-const PROXY_CONNECT_RE_G = /https?:\/\/[^\s)\]]+\/api\/connect\/([a-z][a-z0-9-]*)\b[^\s)\]]*/gi;
+const PROXY_CONNECT_RE_G = /https?:\/\/[^\s)\]"]+\/api\/connect\/([a-z][a-z0-9-]*)\b[^\s)\]"]*/gi;
 
 /**
  * Rewrite every OneCLI/proxy connect URL inside `text` to the

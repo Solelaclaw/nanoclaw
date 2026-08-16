@@ -957,17 +957,22 @@ function createAdapter(): ChannelAdapter | null {
     }
 
     return sessions.sort((a, b) => {
-      const activeDifference = Number(b.indexed && b.status === 'active') - Number(a.indexed && a.status === 'active');
+      const activeDifference =
+        Number(b.indexed && b.status === 'active') - Number(a.indexed && a.status === 'active');
       if (activeDifference !== 0) return activeDifference;
       return (b.last_active ?? b.created_at).localeCompare(a.last_active ?? a.created_at);
     });
   }
 
   /** Re-attach an orphaned or closed legacy web folder to the current web wiring. */
-  function attachLegacyWebSession(session: LegacyWebSession, agentGroupId: string, messagingGroupId: string): void {
-    const existing = getDb().prepare('SELECT agent_group_id FROM sessions WHERE id = ?').get(session.id) as
-      | { agent_group_id: string }
-      | undefined;
+  function attachLegacyWebSession(
+    session: LegacyWebSession,
+    agentGroupId: string,
+    messagingGroupId: string,
+  ): void {
+    const existing = getDb()
+      .prepare('SELECT agent_group_id FROM sessions WHERE id = ?')
+      .get(session.id) as { agent_group_id: string } | undefined;
 
     if (existing && existing.agent_group_id !== agentGroupId) {
       throw new Error(`legacy session ${session.id} belongs to a different agent group`);
@@ -1032,7 +1037,8 @@ function createAdapter(): ChannelAdapter | null {
       writeJson(res, 400, { error: 'invalid conversationId' });
       return;
     }
-    const conversationId = requestedConversationId === LEGACY_CONVERSATION_ID ? null : requestedConversationId;
+    const conversationId =
+      requestedConversationId === LEGACY_CONVERSATION_ID ? null : requestedConversationId;
 
     try {
       const mg = getMessagingGroupByPlatform(CHANNEL_TYPE, platformId);
@@ -1046,7 +1052,9 @@ function createAdapter(): ChannelAdapter | null {
       if (conversationId) {
         if (mg.is_group === 0) updateMessagingGroup(mg.id, { is_group: 1 });
         getDb()
-          .prepare("UPDATE messaging_group_agents SET session_mode = 'per-thread' WHERE messaging_group_id = ?")
+          .prepare(
+            "UPDATE messaging_group_agents SET session_mode = 'per-thread' WHERE messaging_group_id = ?",
+          )
           .run(mg.id);
       } else {
         // A legacy agent-shared session can be closed, missing from the
@@ -1061,11 +1069,15 @@ function createAdapter(): ChannelAdapter | null {
               LIMIT 1`,
           )
           .get(mg.id) as { agent_group_id: string } | undefined;
-        const legacySession = wiring ? findLegacyWebSessions(userId, wiring.agent_group_id)[0] : null;
+        const legacySession = wiring
+          ? findLegacyWebSessions(userId, wiring.agent_group_id)[0]
+          : null;
         if (
           wiring &&
           legacySession &&
-          (!legacySession.indexed || legacySession.status !== 'active' || legacySession.messaging_group_id !== mg.id)
+          (!legacySession.indexed ||
+            legacySession.status !== 'active' ||
+            legacySession.messaging_group_id !== mg.id)
         ) {
           attachLegacyWebSession(legacySession, wiring.agent_group_id, mg.id);
         }
@@ -3290,7 +3302,9 @@ function createAdapter(): ChannelAdapter | null {
             ORDER BY s.created_at DESC
             LIMIT 1`,
         )
-        .get(agentGroupId, CHANNEL_TYPE, platformIdFor(userId), conversationId) as { id: string } | undefined;
+        .get(agentGroupId, CHANNEL_TYPE, platformIdFor(userId), conversationId) as
+        | { id: string }
+        | undefined;
       sessionIds = session ? [session.id] : [];
     }
 
@@ -3357,7 +3371,7 @@ function createAdapter(): ChannelAdapter | null {
               merged.push({
                 ...row,
                 role: source.role,
-                _ts: parseSqliteTimestamp(row.timestamp),
+                _ts: Date.parse(row.timestamp) || 0,
               });
             }
           } finally {
@@ -3375,35 +3389,8 @@ function createAdapter(): ChannelAdapter | null {
 
     merged.sort((a, b) => a._ts - b._ts);
     writeJson(res, 200, {
-      messages: merged.slice(-limit).map(({ _ts, ...row }) => ({
-        ...row,
-        // Emit a proper ISO-UTC timestamp so browsers in any timezone
-        // parse it identically.
-        timestamp: _ts > 0 ? new Date(_ts).toISOString() : row.timestamp,
-      })),
+      messages: merged.slice(-limit).map(({ _ts: _ignored, ...row }) => row),
     });
-  }
-
-  /**
-   * Parse a session-DB timestamp to epoch ms, treating timezone-less
-   * values as UTC.
-   *
-   * inbound.db stores ISO-UTC ("...T06:43:01.208Z") while outbound.db
-   * stores SQLite's CURRENT_TIMESTAMP ("2026-08-14 06:43:47" — UTC but
-   * with NO zone marker). Bare Date.parse reads the naive form as LOCAL
-   * time, so on a TZ!=UTC host every assistant row sorted hours early
-   * and a user's question rendered below its own answers.
-   */
-  function parseSqliteTimestamp(value: unknown): number {
-    if (typeof value === 'number') {
-      return value > 1e12 ? value : value * 1000;
-    }
-    const raw = String(value ?? '').trim();
-    if (!raw) return 0;
-    const hasZone = /(?:[zZ]|[+-]\d\d:?\d\d)$/.test(raw);
-    const iso = hasZone ? raw : `${raw.replace(' ', 'T')}Z`;
-    const parsed = Date.parse(iso);
-    return Number.isFinite(parsed) ? parsed : 0;
   }
 
   /**

@@ -434,10 +434,7 @@ async function buildContainerArgs(
   if (process.env.SOLELACLAWDE_AGENT_API_TOKEN) {
     args.push('-e', `SOLELACLAWDE_AGENT_API_TOKEN=${process.env.SOLELACLAWDE_AGENT_API_TOKEN}`);
   }
-  args.push(
-    '-e',
-    `SOLELACLAWDE_API_URL=${process.env.SOLELACLAWDE_API_URL ?? 'https://app.solela.ai'}`,
-  );
+  args.push('-e', `SOLELACLAWDE_API_URL=${process.env.SOLELACLAWDE_API_URL ?? 'https://app.solela.ai'}`);
 
   // OpenTelemetry — let the agent-runner inside the container emit
   // per-channel / per-model token + cost metrics. Container-shape

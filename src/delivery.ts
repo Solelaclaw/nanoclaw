@@ -12,7 +12,7 @@ import type Database from 'better-sqlite3';
 import { getRunningSessions, getActiveSessions, createPendingQuestion } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
-import { getMessagingGroupByPlatform } from './db/messaging-groups.js';
+import { getMessagingGroupByPlatform, getMessagingGroupsByAgentGroup } from './db/messaging-groups.js';
 import {
   getDueOutboundMessages,
   getDeliveredIds,
@@ -377,6 +377,50 @@ async function deliverMessage(
     platformMsgId,
     fileCount: files?.length,
   });
+
+  // ── Dual delivery: mirror chat messages to other wired channels ────────
+  // When a session has multiple messaging groups (e.g. web + WhatsApp), the
+  // agent's reply goes to the session's default route. This block fans it
+  // out to every OTHER wired channel so the user sees the response wherever
+  // they messaged from.
+  if (msg.kind === 'chat' && msg.channel_type && msg.platform_id) {
+    try {
+      const allMgs = getMessagingGroupsByAgentGroup(session.agent_group_id);
+      for (const mg of allMgs) {
+        // Skip the channel we just delivered to
+        if (mg.channel_type === msg.channel_type && mg.platform_id === msg.platform_id) continue;
+        // Skip agent-type destinations
+        if (mg.channel_type === 'agent') continue;
+        try {
+          await deliveryAdapter!.deliver(
+            mg.channel_type,
+            mg.platform_id,
+            null, // no thread for mirrored messages
+            msg.kind,
+            msg.content,
+            files,
+          );
+          log.info('Dual delivery mirrored', {
+            id: msg.id,
+            mirrorChannel: mg.channel_type,
+            mirrorPlatform: mg.platform_id,
+          });
+        } catch (mirrorErr) {
+          log.warn('Dual delivery mirror failed (non-fatal)', {
+            id: msg.id,
+            mirrorChannel: mg.channel_type,
+            mirrorPlatform: mg.platform_id,
+            err: mirrorErr instanceof Error ? mirrorErr.message : String(mirrorErr),
+          });
+        }
+      }
+    } catch (dualErr) {
+      log.warn('Dual delivery lookup failed (non-fatal)', {
+        id: msg.id,
+        err: dualErr instanceof Error ? dualErr.message : String(dualErr),
+      });
+    }
+  }
 
   clearOutbox(session.agent_group_id, session.id, msg.id);
 
