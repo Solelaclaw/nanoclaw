@@ -14,6 +14,7 @@ import './apollo.js';
 import './campaigns.js';
 import './todos.js';
 import './agent-step.js';
+import './render-ui.js';
 import { startMcpServer } from './server.js';
 
 function log(msg: string): void {

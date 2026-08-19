@@ -153,6 +153,40 @@ describe('deliverSessionMessages — concurrent invocations', () => {
 
     expect(callCount).toBe(1);
   });
+
+  it('degrades render_ui payloads to fallback text for non-web channel adapters without rewriting stored outbound content', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const originalContent = JSON.stringify({
+      type: 'ui',
+      spec: { kind: 'chip', icon: 'clock', label: 'Queued' },
+      fallbackText: 'Queued confirmation',
+    });
+    const outDb = new Database(outboundDbPath('ag-1', session.id));
+    outDb
+      .prepare(
+        `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
+         VALUES (?, datetime('now'), 'chat-sdk', 'telegram:123', 'telegram', ?)`,
+      )
+      .run('out-ui', originalContent);
+    outDb.close();
+
+    const calls: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        calls.push(content);
+        return 'plat-ui';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([JSON.stringify({ text: 'Queued confirmation' })]);
+    const verifyDb = new Database(outboundDbPath('ag-1', session.id), { readonly: true });
+    const row = verifyDb.prepare('SELECT content FROM messages_out WHERE id = ?').get('out-ui') as { content: string };
+    verifyDb.close();
+    expect(row.content).toBe(originalContent);
+  });
 });
 
 describe('deliverSessionMessages — retry and permanent failure', () => {

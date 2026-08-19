@@ -13,7 +13,7 @@
  */
 import { describe, it, expect } from 'vitest';
 
-import { parseSessionTimestamp } from './web.js';
+import { parseSessionTimestamp, scheduledTaskLabel, scheduledTaskSchedule } from './web.js';
 
 /** Same instant, as each DB would store it. */
 const INSTANT_UTC_MS = Date.UTC(2026, 6, 17, 12, 53, 0);
@@ -66,5 +66,26 @@ describe('parseSessionTimestamp', () => {
       .map((r) => r.role);
 
     expect(sorted).toEqual(['user', 'assistant', 'user', 'assistant']);
+  });
+});
+
+describe('scheduled task helpers', () => {
+  it('derives a label from task prompt content', () => {
+    expect(scheduledTaskLabel(JSON.stringify({ prompt: 'Send the weekly report' }))).toBe('Send the weekly report');
+  });
+
+  it('falls back safely for raw or malformed task content', () => {
+    expect(scheduledTaskLabel('{not-json')).toBe('{not-json');
+    expect(scheduledTaskLabel('')).toBe('Scheduled task');
+  });
+
+  it('derives human schedule text from recurrence and process_after', () => {
+    expect(scheduledTaskSchedule('0 9 * * *', '2026-08-20T06:00:00.000Z')).toBe('Daily at 09:00');
+    expect(scheduledTaskSchedule('30 14 * * 1', '2026-08-24T11:30:00.000Z')).toBe(
+      'Weekly on Monday at 14:30',
+    );
+    expect(scheduledTaskSchedule('*/15 * * * *', '2026-08-20T06:00:00.000Z')).toBe('Every 15 minutes');
+    expect(scheduledTaskSchedule(null, '2026-08-20T06:00:00.000Z')).toBe('One time');
+    expect(scheduledTaskSchedule('5 4 1 * *', '2026-09-01T04:05:00.000Z')).toBe('Recurring (5 4 1 * *)');
   });
 });

@@ -204,4 +204,25 @@ describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
     const msg = calls[0].message as { markdown?: string };
     expect(msg.markdown).toBe('plain hello');
   });
+
+  it('falls back to text for render_ui payloads on non-web chat-sdk adapters', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    const id = await bridge.deliver('telegram:42', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ui',
+        spec: { kind: 'chip', icon: 'clock', label: 'Queued' },
+        fallbackText: 'Queued confirmation',
+      },
+    });
+    expect(id).toBe('msg-stub');
+    expect(calls).toHaveLength(1);
+    const msg = calls[0].message as { markdown?: string; fallbackText?: string };
+    expect(msg.markdown).toBe('Queued confirmation');
+    expect(msg.fallbackText).toBe('Queued confirmation');
+  });
 });

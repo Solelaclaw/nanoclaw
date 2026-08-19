@@ -617,6 +617,18 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         return lastId;
       }
 
+      // Web-native UI payloads degrade to fallback text on generic chat-sdk
+      // adapters. The web adapter handles `{ type: 'ui' }` before this bridge.
+      if (content.type === 'ui') {
+        const fallbackText = content.fallbackText as string | undefined;
+        if (fallbackText) {
+          const r = await adapter.postMessage(tid, { markdown: fallbackText, fallbackText });
+          return r?.id;
+        }
+        log.warn('render_ui payload missing fallbackText, skipping delivery');
+        return;
+      }
+
       // Normal message
       const rawText = (content.markdown as string) || (content.text as string);
       const text = rawText ? transformText(rawText) : rawText;
