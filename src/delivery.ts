@@ -250,7 +250,7 @@ async function deliverMessage(
     return;
   }
 
-  const content = JSON.parse(msg.content);
+  const content = JSON.parse(msg.content) as Record<string, unknown>;
 
   // System actions — handle internally (schedule_task, cancel_task, etc.)
   if (msg.kind === 'system') {
@@ -316,15 +316,16 @@ async function deliverMessage(
   // exist and we skip persistence — the card still delivers to the user,
   // but the response path has nowhere to land and will log unclaimed.
   if (content.type === 'ask_question' && content.questionId && hasTable(getDb(), 'pending_questions')) {
+    const questionId = String(content.questionId);
     const title = content.title as string | undefined;
     const rawOptions = content.options as unknown;
     if (!title || !Array.isArray(rawOptions)) {
       log.error('ask_question missing required title/options — not persisting', {
-        questionId: content.questionId,
+        questionId,
       });
     } else {
       const inserted = createPendingQuestion({
-        question_id: content.questionId,
+        question_id: questionId,
         session_id: session.id,
         message_out_id: msg.id,
         platform_id: msg.platform_id,
@@ -360,7 +361,14 @@ async function deliverMessage(
   // receive the canonical URL. See connect-url-rewrite.ts for the
   // pattern matched. Pure transform — no-op if no connect URL present
   // (fast path).
-  const rewrittenContent = rewriteConnectUrls(msg.content);
+  const outboundContent =
+    msg.kind === 'chat-sdk' &&
+    content.type === 'ui' &&
+    msg.channel_type !== 'web' &&
+    typeof content.fallbackText === 'string'
+      ? JSON.stringify({ text: content.fallbackText })
+      : msg.content;
+  const rewrittenContent = rewriteConnectUrls(outboundContent);
 
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channel_type,

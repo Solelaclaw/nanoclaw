@@ -149,6 +149,59 @@ export function parseSessionTimestamp(ts: string): number {
   return Date.parse(`${iso}Z`);
 }
 
+export function scheduledTaskLabel(content: unknown): string {
+  const fallback = String(content ?? '').trim();
+  try {
+    const parsed = typeof content === 'string' ? (JSON.parse(content) as Record<string, unknown>) : content;
+    if (parsed && typeof parsed === 'object') {
+      const obj = parsed as Record<string, unknown>;
+      const value = obj.prompt ?? obj.text ?? obj.content;
+      if (typeof value === 'string' && value.trim()) return value.trim().slice(0, 120);
+    }
+  } catch {
+    // Use raw content below.
+  }
+  return fallback ? fallback.slice(0, 120) : 'Scheduled task';
+}
+
+export function scheduledTaskSchedule(recurrence: string | null, processAfter: string | null): string {
+  if (recurrence) {
+    const parts = recurrence.trim().split(/\s+/);
+    if (parts.length === 5) {
+      const [minute, hour, dayOfMonth, month, dayOfWeek] = parts;
+      if (minute === '*' && hour === '*' && dayOfMonth === '*' && month === '*' && dayOfWeek === '*') {
+        return 'Every minute';
+      }
+      const everyMinutes = minute.match(/^\*\/(\d+)$/) ?? minute.match(/^0\/(\d+)$/);
+      if (everyMinutes && hour === '*' && dayOfMonth === '*' && month === '*' && dayOfWeek === '*') {
+        const n = Number(everyMinutes[1]);
+        return n === 1 ? 'Every minute' : `Every ${n} minutes`;
+      }
+      if (isCronNumber(minute) && isCronNumber(hour) && dayOfMonth === '*' && month === '*' && dayOfWeek === '*') {
+        return `Daily at ${formatCronTime(hour, minute)}`;
+      }
+      if (isCronNumber(minute) && isCronNumber(hour) && dayOfMonth === '*' && month === '*' && isCronNumber(dayOfWeek)) {
+        return `Weekly on ${weekdayName(Number(dayOfWeek))} at ${formatCronTime(hour, minute)}`;
+      }
+    }
+    return `Recurring (${recurrence.trim()})`;
+  }
+  if (processAfter) return 'One time';
+  return 'Ready when agent wakes';
+}
+
+function isCronNumber(value: string): boolean {
+  return /^\d+$/.test(value);
+}
+
+function formatCronTime(hour: string, minute: string): string {
+  return `${hour.padStart(2, '0')}:${minute.padStart(2, '0')}`;
+}
+
+function weekdayName(day: number): string {
+  return ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][day % 7] ?? `day ${day}`;
+}
+
 /** Per-file cap on inbound attachments (decoded bytes). The web app enforces
  * the same ceiling client- and server-side; this is the last line of defence
  * before a file is written into the session inbox. */
@@ -716,6 +769,11 @@ function createAdapter(): ChannelAdapter | null {
           return;
         }
 
+        if (req.method === 'GET' && url.startsWith('/admin/scheduled-tasks')) {
+          handleScheduledTasks(res, url);
+          return;
+        }
+
         if (req.method === 'GET' && url.startsWith('/admin/contacts')) {
           handleContactsFromMemory(res, url);
           return;
@@ -929,6 +987,17 @@ function createAdapter(): ChannelAdapter | null {
         broadcast(userId, {
           ...conversation,
           carousel: content.items,
+          fallbackText: content.fallbackText,
+        });
+        return undefined;
+      }
+
+      // UI payload — emitted by render_ui. The web app owns rendering for
+      // boards/chips; history keeps the original outbound row unchanged.
+      if (content && content.type === 'ui' && content.spec && typeof content.spec === 'object') {
+        broadcast(userId, {
+          ...conversation,
+          ui: content.spec,
           fallbackText: content.fallbackText,
         });
         return undefined;
@@ -3518,6 +3587,103 @@ function createAdapter(): ChannelAdapter | null {
         timestamp: _ts > 0 ? new Date(_ts).toISOString() : row.timestamp,
       })),
     });
+  }
+
+  /**
+   * List live scheduled task rows for the signed-in user's web sessions.
+   *
+   * GET /admin/scheduled-tasks?userId=<id>&agentGroupId=<id>
+   */
+  function handleScheduledTasks(res: http.ServerResponse, url: string): void {
+    const parsed = new URL(url, 'http://x');
+    const userId = parsed.searchParams.get('userId');
+    const agentGroupId = parsed.searchParams.get('agentGroupId');
+    if (!userId || !agentGroupId) {
+      writeJson(res, 400, { error: 'userId and agentGroupId required' });
+      return;
+    }
+    if (!hasWebAgentAccess(userId, agentGroupId)) {
+      writeJson(res, 403, { error: 'agent group not owned by user' });
+      return;
+    }
+
+    interface TaskRow {
+      id: string;
+      label: string;
+      schedule: string;
+      next: string;
+      _seq: number;
+    }
+
+    const tasksById = new Map<string, TaskRow>();
+    for (const sessionId of findWebSessionIds(userId, agentGroupId)) {
+      const dbPath = path.join(DATA_DIR, 'v2-sessions', agentGroupId, sessionId, 'inbound.db');
+      if (!fs.existsSync(dbPath)) continue;
+      try {
+        const db = new BetterSqlite3(dbPath, { readonly: true, fileMustExist: true });
+        try {
+          const rows = db
+            .prepare(
+              `SELECT COALESCE(series_id, id) AS id, process_after, recurrence, content, MAX(seq) AS _seq
+                 FROM messages_in
+                WHERE kind = 'task'
+                  AND status IN ('pending', 'paused')
+                  AND (channel_type = ? OR channel_type IS NULL)
+                GROUP BY COALESCE(series_id, id)
+                ORDER BY process_after ASC`,
+            )
+            .all(CHANNEL_TYPE) as Array<{
+            id: string;
+            process_after: string | null;
+            recurrence: string | null;
+            content: string;
+            _seq: number;
+          }>;
+          for (const row of rows) {
+            const existing = tasksById.get(row.id);
+            if (existing && existing._seq >= row._seq) continue;
+            tasksById.set(row.id, {
+              id: row.id,
+              label: scheduledTaskLabel(row.content),
+              schedule: scheduledTaskSchedule(row.recurrence, row.process_after),
+              next: row.process_after ?? '',
+              _seq: row._seq,
+            });
+          }
+        } finally {
+          db.close();
+        }
+      } catch (err) {
+        log.warn('scheduled-tasks: failed reading session database', { sessionId, err });
+      }
+    }
+
+    const tasks = [...tasksById.values()]
+      .sort((a, b) => {
+        if (a.next && b.next) return a.next.localeCompare(b.next);
+        if (a.next) return -1;
+        if (b.next) return 1;
+        return a.label.localeCompare(b.label);
+      })
+      .map(({ _seq, ...row }) => row);
+    writeJson(res, 200, tasks);
+  }
+
+  function findWebSessionIds(userId: string, agentGroupId: string): string[] {
+    const rows = getDb()
+      .prepare(
+        `SELECT s.id
+           FROM sessions s
+           JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+           JOIN messaging_group_agents mga
+             ON mga.messaging_group_id = mg.id
+            AND mga.agent_group_id = s.agent_group_id
+          WHERE s.agent_group_id = ?
+            AND mg.channel_type = ?
+            AND mg.platform_id = ?`,
+      )
+      .all(agentGroupId, CHANNEL_TYPE, platformIdFor(userId)) as Array<{ id: string }>;
+    return [...new Set([...rows.map((row) => row.id), ...findLegacyWebSessions(userId, agentGroupId).map((s) => s.id)])];
   }
 
   /**
